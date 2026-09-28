@@ -1,0 +1,26 @@
+{
+  "name": "claude-code",
+  "description": "claude: a coding agent in the guest (Anthropic Messages API, or an OpenAI-compatible server such as a local LLM)",
+  "extraAllowedHeaders": [
+    "anthropic-version",
+    "anthropic-beta",
+    "mcp-session-id",
+    "mcp-protocol-version"
+  ],
+  "apiKey": {
+    "selector": "provider",
+    "default": "anthropic",
+    "variants": {
+      "anthropic": {
+        "baseUrl": "https://api.anthropic.com",
+        "header": "x-api-key",
+        "value": "{key}"
+      },
+      "openai": {
+        "baseUrl": "https://api.openai.com/v1",
+        "header": "authorization",
+        "value": "Bearer {key}"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "collabo-claude"
+version = "0.1.0"
+edition = "2021"
+description = "claude: a coding agent for the collaboCore guest (Anthropic Messages API or OpenAI-compatible servers)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "claude"
+path = "src/main.rs"
+
+[dependencies]
+glob = "0.3"
+libc = "0.2"
+regex = "1"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
