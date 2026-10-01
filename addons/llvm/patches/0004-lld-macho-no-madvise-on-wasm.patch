@@ -1,0 +1,13 @@
+--- a/lld/MachO/Driver.cpp
++++ b/lld/MachO/Driver.cpp
+@@ -356,7 +356,9 @@
+     totalBytes += buff.size();
+     numDeferedFilesAdvised += 1;
+ #endif
+-#if _WIN32
++#if defined(__wasm__)
++    // No mmap here: the file was read into memory already.
++#elif _WIN32
+     // Reference all file's mmap'd pages to load them into memory.
+     for (const char *page = buff.data(), *end = page + buff.size();
+          page < end && !pageInQueue.stopAllWork; page += pageSize) {

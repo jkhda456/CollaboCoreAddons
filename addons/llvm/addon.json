@@ -1,0 +1,4 @@
+{
+  "name": "llvm",
+  "description": "LLVM toolchain in the guest: clang, opt, llc, llvm-mc, lld, llvm-readobj, llvm-objdump, llvm-nm, llvm-dwarfdump, llvm-symbolizer, llvm-objcopy as wasm32 Linux programs"
+}

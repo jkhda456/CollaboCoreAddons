@@ -1,0 +1,157 @@
+--- a/llvm/lib/Support/Unix/Memory.inc
++++ b/llvm/lib/Support/Unix/Memory.inc
+@@ -11,6 +11,8 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "Unix.h"
++#include <cstdlib>
++#include <cstring>
+ #include "llvm/Config/config.h"
+ #include "llvm/Support/Alignment.h"
+ #include "llvm/Support/DataTypes.h"
+@@ -36,6 +38,7 @@
+ extern "C" void __clear_cache(void *, void *);
+ #endif
+ 
++#ifndef __wasm__
+ static int getPosixProtectionFlags(unsigned Flags) {
+   switch (Flags & llvm::sys::Memory::MF_RWE_MASK) {
+   case llvm::sys::Memory::MF_READ:
+@@ -66,10 +69,54 @@
+   // Provide a default return value as required by some compilers.
+   return PROT_NONE;
+ }
++#endif
+ 
+ namespace llvm {
+ namespace sys {
+ 
++#ifdef __wasm__
++// No MMU (and no mmap): "mapped" memory is page-aligned heap memory, always readable and
++// writable. Nothing here can be made executable.
++MemoryBlock Memory::allocateMappedMemory(size_t NumBytes,
++                                         const MemoryBlock *const NearBlock,
++                                         unsigned PFlags, std::error_code &EC) {
++  EC = std::error_code();
++  if (NumBytes == 0)
++    return MemoryBlock();
++  if (PFlags & MF_EXEC) {
++    EC = std::make_error_code(std::errc::not_supported);
++    return MemoryBlock();
++  }
++  static const size_t PageSize = Process::getPageSizeEstimate();
++  size_t Size = alignTo(NumBytes, PageSize);
++  void *Addr = ::aligned_alloc(PageSize, Size);
++  if (!Addr) {
++    EC = std::make_error_code(std::errc::not_enough_memory);
++    return MemoryBlock();
++  }
++  ::memset(Addr, 0, Size);
++  MemoryBlock Result;
++  Result.Address = Addr;
++  Result.AllocatedSize = Size;
++  Result.Flags = PFlags;
++  return Result;
++}
++
++std::error_code Memory::releaseMappedMemory(MemoryBlock &M) {
++  ::free(M.Address);
++  M.Address = nullptr;
++  M.AllocatedSize = 0;
++  return std::error_code();
++}
++
++std::error_code Memory::protectMappedMemory(const MemoryBlock &M,
++                                            unsigned Flags) {
++  if (M.Address != nullptr && M.AllocatedSize != 0 && (Flags & MF_EXEC))
++    return std::make_error_code(std::errc::not_supported);
++  return std::error_code();
++}
++#else
++
+ MemoryBlock Memory::allocateMappedMemory(size_t NumBytes,
+                                          const MemoryBlock *const NearBlock,
+                                          unsigned PFlags, std::error_code &EC) {
+@@ -203,6 +250,7 @@
+ 
+   return std::error_code();
+ }
++#endif // __wasm__
+ 
+ /// InvalidateInstructionCache - Before the JIT can run a block of code
+ /// that has been emitted it must invalidate the instruction cache on some
+--- a/llvm/lib/Support/Unix/Path.inc
++++ b/llvm/lib/Support/Unix/Path.inc
+@@ -865,6 +865,10 @@
+ std::error_code mapped_file_region::init(file_t FD, uint64_t Offset,
+                                          mapmode Mode, const char *Name) {
+   assert(Size != 0);
++#ifdef __wasm__
++  // No mmap here; callers fall back to reading the file.
++  return make_error_code(errc::not_supported);
++#else
+ 
+   int flags = (Mode == readwrite) ? MAP_SHARED : MAP_PRIVATE;
+   int prot = (Mode == readonly) ? PROT_READ : (PROT_READ | PROT_WRITE);
+@@ -895,6 +899,7 @@
+   if (Mapping == MAP_FAILED)
+     return errnoAsErrorCode();
+   return std::error_code();
++#endif
+ }
+ 
+ mapped_file_region::mapped_file_region(file_t fd, mapmode mode, size_t length,
+@@ -910,13 +915,17 @@
+ }
+ 
+ void mapped_file_region::unmapImpl() {
++#ifndef __wasm__
+   if (Mapping)
+     ::munmap(Mapping, Size);
++#endif
+ }
+ 
+ std::error_code mapped_file_region::sync() const {
++#ifndef __wasm__
+   if (int Res = sys::RetryAfterSignal(-1, ::msync, Mapping, Size, MS_SYNC))
+     return std::error_code(Res, std::generic_category());
++#endif
+   return std::error_code();
+ }
+ 
+@@ -924,7 +933,7 @@
+   assert(Mode == mapped_file_region::readonly);
+   if (!Mapping)
+     return;
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__wasm__)
+     // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
+ #elif defined(POSIX_MADV_DONTNEED)
+   ::posix_madvise(Mapping, Size, POSIX_MADV_DONTNEED);
+@@ -937,7 +946,7 @@
+   assert(Mode == mapped_file_region::readonly);
+   if (!Mapping)
+     return;
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__wasm__)
+   // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
+ #elif defined(POSIX_MADV_WILLNEED)
+   ::posix_madvise(Mapping, Size, POSIX_MADV_WILLNEED);
+@@ -950,7 +959,7 @@
+   assert(Mode == mapped_file_region::readonly);
+   if (!Mapping)
+     return;
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__wasm__)
+   // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
+ #elif defined(POSIX_MADV_RANDOM)
+   ::posix_madvise(Mapping, Size, POSIX_MADV_RANDOM);
+@@ -1266,7 +1275,7 @@
+     return errorCodeToError(EC);
+ // The underlying operation on these platforms allow opening directories
+ // for reading in more cases than other platforms.
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__wasm__)
+   struct stat Status;
+   if (fstat(ResultFD, &Status) == -1)
+     return errorCodeToError(errnoAsErrorCode());

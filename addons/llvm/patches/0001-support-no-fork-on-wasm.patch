@@ -1,0 +1,22 @@
+--- a/llvm/lib/Support/Unix/Program.inc	2026-09-29 20:56:57.880553199 +0000
++++ b/llvm/lib/Support/Unix/Program.inc	2026-09-29 20:56:57.889213982 +0000
+@@ -255,6 +255,11 @@
+     return true;
+   }
+ #endif // HAVE_POSIX_SPAWN
++#ifdef __wasm__
++  // No MMU, so no fork(): posix_spawn above is the only way to start a program.
++  MakeErrMsg(ErrMsg, "posix_spawn is required to run a program");
++  return false;
++#else
+ 
+   // Create a child process.
+   int child = fork();
+@@ -329,6 +334,7 @@
+   PI.Process = child;
+ 
+   return true;
++#endif // __wasm__
+ }
+ 
+ namespace llvm {
