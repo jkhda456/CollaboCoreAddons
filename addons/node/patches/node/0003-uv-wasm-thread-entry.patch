@@ -1,0 +1,50 @@
+diff --git a/deps/uv/src/unix/thread.c b/deps/uv/src/unix/thread.c
+index 001b6d7..840766a 100644
+--- a/deps/uv/src/unix/thread.c
++++ b/deps/uv/src/unix/thread.c
+@@ -135,6 +135,20 @@ int uv_thread_detach(uv_thread_t *tid) {
+ }
+ 
+ 
++#if defined(__wasm__)
++struct uv__thread_start {
++  void (*entry)(void* arg);
++  void* arg;
++};
++
++static void* uv__thread_trampoline(void* p) {
++  struct uv__thread_start start = *(struct uv__thread_start*) p;
++  uv__free(p);
++  start.entry(start.arg);
++  return NULL;
++}
++#endif
++
+ int uv_thread_create_ex(uv_thread_t* tid,
+                         const uv_thread_options_t* params,
+                         void (*entry)(void *arg),
+@@ -177,8 +191,24 @@ int uv_thread_create_ex(uv_thread_t* tid,
+       abort();
+   }
+ 
++#if defined(__wasm__)
++  {
++    struct uv__thread_start* start = uv__malloc(sizeof(*start));
++    if (start == NULL) {
++      err = ENOMEM;
++    } else {
++      start->entry = entry;
++      start->arg = arg;
++      err = pthread_create(tid, attr, uv__thread_trampoline, start);
++      if (err)
++        uv__free(start);
++    }
++    (void) f;
++  }
++#else
+   f.in = entry;
+   err = pthread_create(tid, attr, f.out, arg);
++#endif
+ 
+   if (attr != NULL)
+     pthread_attr_destroy(attr);

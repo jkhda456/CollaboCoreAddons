@@ -1,0 +1,20 @@
+{
+  "name": "node",
+  "description": "node: Node.js 24 in the guest (Node's own lib/ on QuickJS), with npm, npx, bash and ripgrep, for JavaScript programs and npm packages such as the official Claude Code",
+  "apiKey": {
+    "selector": "provider",
+    "default": "anthropic",
+    "variants": {
+      "anthropic": {
+        "baseUrl": "https://api.anthropic.com",
+        "header": "x-api-key",
+        "value": "{key}"
+      },
+      "openai": {
+        "baseUrl": "https://api.openai.com/v1",
+        "header": "authorization",
+        "value": "Bearer {key}"
+      }
+    }
+  }
+}

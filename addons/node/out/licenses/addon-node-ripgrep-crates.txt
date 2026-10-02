@@ -1,0 +1,50 @@
+aho-corasick 1.1.4: Unlicense OR MIT https://github.com/BurntSushi/aho-corasick
+anyhow 1.0.103: MIT OR Apache-2.0 https://github.com/dtolnay/anyhow
+bstr 1.13.0: MIT OR Apache-2.0 https://github.com/BurntSushi/bstr
+cc 1.2.67: MIT OR Apache-2.0 https://github.com/rust-lang/cc-rs
+cfg-if 1.0.4: MIT OR Apache-2.0 https://github.com/rust-lang/cfg-if
+crossbeam-channel 0.5.16: MIT OR Apache-2.0 https://github.com/crossbeam-rs/crossbeam
+crossbeam-deque 0.8.7: MIT OR Apache-2.0 https://github.com/crossbeam-rs/crossbeam
+crossbeam-epoch 0.9.20: MIT OR Apache-2.0 https://github.com/crossbeam-rs/crossbeam
+crossbeam-utils 0.8.22: MIT OR Apache-2.0 https://github.com/crossbeam-rs/crossbeam
+encoding_rs 0.8.35: (Apache-2.0 OR MIT) AND BSD-3-Clause https://github.com/hsivonen/encoding_rs
+encoding_rs_io 0.1.7: MIT OR Apache-2.0 https://github.com/BurntSushi/encoding_rs_io
+find-msvc-tools 0.1.9: MIT OR Apache-2.0 https://github.com/rust-lang/cc-rs
+glob 0.3.3: MIT OR Apache-2.0 https://github.com/rust-lang/glob
+globset 0.4.19: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
+grep 0.4.1: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/grep
+grep-cli 0.1.12: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/cli
+grep-matcher 0.1.9: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/matcher
+grep-pcre2 0.1.10: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/pcre2
+grep-printer 0.3.1: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/printer
+grep-regex 0.1.14: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/regex
+grep-searcher 0.1.17: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/searcher
+ignore 0.4.29: Unlicense OR MIT https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore
+itoa 1.0.18: MIT OR Apache-2.0 https://github.com/dtolnay/itoa
+jobserver 0.1.35: MIT OR Apache-2.0 https://github.com/rust-lang/jobserver-rs
+lexopt 0.3.2: MIT https://github.com/blyxxyz/lexopt
+libc 0.2.186: MIT OR Apache-2.0 https://github.com/rust-lang/libc
+log 0.4.33: MIT OR Apache-2.0 https://github.com/rust-lang/log
+memchr 2.8.3: Unlicense OR MIT https://github.com/BurntSushi/memchr
+memmap2 0.9.11: MIT OR Apache-2.0 https://github.com/RazrFalcon/memmap2-rs
+pcre2 0.2.11: Unlicense OR MIT https://github.com/BurntSushi/rust-pcre2
+pcre2-sys 0.2.10: Unlicense OR MIT https://github.com/BurntSushi/rust-pcre2
+pkg-config 0.3.33: MIT OR Apache-2.0 https://github.com/rust-lang/pkg-config-rs
+proc-macro2 1.0.106: MIT OR Apache-2.0 https://github.com/dtolnay/proc-macro2
+quote 1.0.46: MIT OR Apache-2.0 https://github.com/dtolnay/quote
+regex 1.13.0: MIT OR Apache-2.0 https://github.com/rust-lang/regex
+regex-automata 0.4.15: MIT OR Apache-2.0 https://github.com/rust-lang/regex
+regex-syntax 0.8.11: MIT OR Apache-2.0 https://github.com/rust-lang/regex
+ripgrep 15.2.0: Unlicense OR MIT https://github.com/BurntSushi/ripgrep
+same-file 1.0.6: Unlicense/MIT https://github.com/BurntSushi/same-file
+serde 1.0.228: MIT OR Apache-2.0 https://github.com/serde-rs/serde
+serde_core 1.0.228: MIT OR Apache-2.0 https://github.com/serde-rs/serde
+serde_derive 1.0.228: MIT OR Apache-2.0 https://github.com/serde-rs/serde
+serde_json 1.0.150: MIT OR Apache-2.0 https://github.com/serde-rs/json
+shlex 2.0.1: MIT OR Apache-2.0 https://github.com/comex/rust-shlex
+syn 2.0.119: MIT OR Apache-2.0 https://github.com/dtolnay/syn
+termcolor 1.4.1: Unlicense OR MIT https://github.com/BurntSushi/termcolor
+textwrap 0.16.2: MIT https://github.com/mgeisler/textwrap
+unicode-ident 1.0.24: (MIT OR Apache-2.0) AND Unicode-3.0 https://github.com/dtolnay/unicode-ident
+walkdir 2.5.0: Unlicense/MIT https://github.com/BurntSushi/walkdir
+zmij 1.0.23: MIT https://github.com/dtolnay/zmij

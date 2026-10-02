@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Generates src/unicode_tables.inc: the per-code-point properties Intl's
+segmenters need (UAX #29 grapheme / word / sentence break classes,
+Extended_Pictographic, Indic_Conjunct_Break, and the "dictionary" scripts
+ICU segments words by dictionary).
+
+The tables are committed; run this only to move to a new Unicode version:
+
+  tools/gen-unicode-tables.py [ucd-dir] > src/unicode_tables.inc
+
+Without ucd-dir the files are downloaded from
+https://www.unicode.org/Public/<UNICODE_VERSION>/ucd/ (the version of the
+ICU in the Node.js release we follow: Node 24.21 = ICU 78.3 = Unicode 17.0).
+"""
+import os
+import re
+import sys
+import urllib.request
+
+UNICODE_VERSION = "17.0.0"
+BASE = "https://www.unicode.org/Public/%s/ucd/" % UNICODE_VERSION
+FILES = {
+    "GraphemeBreakProperty.txt": "auxiliary/GraphemeBreakProperty.txt",
+    "WordBreakProperty.txt": "auxiliary/WordBreakProperty.txt",
+    "SentenceBreakProperty.txt": "auxiliary/SentenceBreakProperty.txt",
+    "emoji-data.txt": "emoji/emoji-data.txt",
+    "DerivedCoreProperties.txt": "DerivedCoreProperties.txt",
+    "Scripts.txt": "Scripts.txt",
+    "LineBreak.txt": "LineBreak.txt",
+}
+
+# value lists: the index is the code used in C (intl.c has the same enums)
+GCB = ["Other", "CR", "LF", "Control", "Extend", "ZWJ", "Regional_Indicator", "Prepend",
+       "SpacingMark", "L", "V", "T", "LV", "LVT"]
+WB = ["Other", "CR", "LF", "Newline", "Extend", "ZWJ", "Regional_Indicator", "Format",
+      "Katakana", "Hebrew_Letter", "ALetter", "Single_Quote", "Double_Quote", "MidNumLet",
+      "MidLetter", "MidNum", "Numeric", "ExtendNumLet", "WSegSpace"]
+SB = ["Other", "CR", "LF", "Extend", "Sep", "Format", "Sp", "Lower", "Upper", "OLetter",
+      "Numeric", "ATerm", "SContinue", "STerm", "Close"]
+INCB = ["None", "Linker", "Consonant", "Extend"]
+# Han / Hiragana; Line_Break=SA (Thai, Lao, Khmer, Myanmar); Hangul syllables
+DICT = ["None", "Ideo", "SA", "Hangul"]
+
+SHIFT = 7
+MAXCP = 0x110000
+
+
+def read(ucd, name):
+    if ucd:
+        with open(os.path.join(ucd, name), encoding="utf-8") as f:
+            return f.read()
+    with urllib.request.urlopen(BASE + FILES[name]) as r:
+        return r.read().decode("utf-8")
+
+
+def ranges(text, want=None):
+    """(first, last, value[, extra]) from a UCD property file"""
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = [x.strip() for x in line.split(";")]
+        cps = fields[0]
+        if ".." in cps:
+            a, b = cps.split("..")
+            a, b = int(a, 16), int(b, 16)
+        else:
+            a = b = int(cps, 16)
+        yield a, b, fields[1:]
+
+
+def main():
+    ucd = sys.argv[1] if len(sys.argv) > 1 else None
+    gcb = bytearray(MAXCP)
+    wb = bytearray(MAXCP)
+    sb = bytearray(MAXCP)
+    incb = bytearray(MAXCP)
+    ext = bytearray(MAXCP)
+    dic = bytearray(MAXCP)
+    for a, b, f in ranges(read(ucd, "GraphemeBreakProperty.txt")):
+        v = GCB.index(f[0])
+        for c in range(a, b + 1):
+            gcb[c] = v
+    for a, b, f in ranges(read(ucd, "WordBreakProperty.txt")):
+        v = WB.index(f[0])
+        for c in range(a, b + 1):
+            wb[c] = v
+    for a, b, f in ranges(read(ucd, "SentenceBreakProperty.txt")):
+        v = SB.index(f[0])
+        for c in range(a, b + 1):
+            sb[c] = v
+    for a, b, f in ranges(read(ucd, "emoji-data.txt")):
+        if f[0] == "Extended_Pictographic":
+            for c in range(a, b + 1):
+                ext[c] = 1
+    for a, b, f in ranges(read(ucd, "DerivedCoreProperties.txt")):
+        if f[0] == "InCB":
+            v = INCB.index(f[1])
+            for c in range(a, b + 1):
+                incb[c] = v
+    for a, b, f in ranges(read(ucd, "Scripts.txt")):
+        if f[0] in ("Han", "Hiragana"):
+            for c in range(a, b + 1):
+                dic[c] = 1
+    for a, b, f in ranges(read(ucd, "LineBreak.txt")):
+        if f[0] == "SA":
+            for c in range(a, b + 1):
+                if wb[c] in (0, 10):  # letters ICU sends to its dictionaries
+                    dic[c] = 2
+
+    for c in range(0xAC00, 0xD7A4):
+        dic[c] = 3
+
+    # packed: gcb 4 | ext 1 | incb 2 | wb 5 | sb 4 | dict 2
+    combos = {}
+    values = []
+    idx = []
+    for c in range(MAXCP):
+        v = gcb[c] | ext[c] << 4 | incb[c] << 5 | wb[c] << 7 | sb[c] << 12 | dic[c] << 16
+        i = combos.get(v)
+        if i is None:
+            i = combos[v] = len(values)
+            values.append(v)
+        idx.append(i)
+    assert len(values) < 65536
+    blocks = {}
+    stage1 = []
+    stage2 = []
+    size = 1 << SHIFT
+    for start in range(0, MAXCP, size):
+        blk = tuple(idx[start:start + size])
+        b = blocks.get(blk)
+        if b is None:
+            b = blocks[blk] = len(stage2) // size
+            stage2.extend(blk)
+        stage1.append(b)
+
+    out = []
+    out.append("/* generated by tools/gen-unicode-tables.py from the Unicode %s UCD"
+               % UNICODE_VERSION)
+    out.append("   (%s): do not edit */" % BASE)
+    out.append("#define UPROPS_UNICODE_VERSION \"%s\"" % UNICODE_VERSION)
+    out.append("#define UPROPS_SHIFT %d" % SHIFT)
+    out.append("static const uint32_t uprops_values[%d] = {" % len(values))
+    for i in range(0, len(values), 8):
+        out.append("  " + ", ".join("0x%05x" % v for v in values[i:i + 8]) + ",")
+    out.append("};")
+    t1 = "uint8_t" if max(stage1) < 256 else "uint16_t"
+    out.append("static const %s uprops_stage1[%d] = {" % (t1, len(stage1)))
+    for i in range(0, len(stage1), 16):
+        out.append("  " + ",".join(str(v) for v in stage1[i:i + 16]) + ",")
+    out.append("};")
+    t2 = "uint8_t" if len(values) < 256 else "uint16_t"
+    out.append("static const %s uprops_stage2[%d] = {" % (t2, len(stage2)))
+    for i in range(0, len(stage2), 32):
+        out.append("  " + ",".join(str(v) for v in stage2[i:i + 32]) + ",")
+    out.append("};")
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stderr.write("values %d, blocks %d, stage1 %s, stage2 %d %s\n"
+                     % (len(values), len(blocks), t1, len(stage2), t2))
+
+
+if __name__ == "__main__":
+    main()

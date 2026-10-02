@@ -1,0 +1,117 @@
+diff --git a/deps/uv/src/unix/process.c b/deps/uv/src/unix/process.c
+index 539e7d9..08b7285 100644
+--- a/deps/uv/src/unix/process.c
++++ b/deps/uv/src/unix/process.c
+@@ -55,6 +55,16 @@
+ extern char **environ;
+ #endif
+ 
++/* collaboCore: UV_POSIX_SPAWN_ONLY starts children with posix_spawn alone, for
++   a Linux without fork() (WebAssembly). */
++#if defined(UV_POSIX_SPAWN_ONLY)
++# include <spawn.h>
++# include <paths.h>
++# ifndef _PATH_DEFPATH
++#  define _PATH_DEFPATH "/usr/local/bin:/bin:/usr/bin"
++# endif
++#endif
++
+ #if defined(__linux__) || \
+     defined(__GNU__)
+ # include <grp.h>
+@@ -417,7 +427,7 @@ static void uv__process_child_init(const uv_process_options_t* options,
+ }
+ 
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(UV_POSIX_SPAWN_ONLY)
+ typedef struct uv__posix_spawn_fncs_tag {
+   struct {
+     int (*addchdir_np)(const posix_spawn_file_actions_t *, const char *);
+@@ -431,13 +441,22 @@ static int posix_spawn_can_use_setsid;
+ 
+ 
+ static void uv__spawn_init_posix_spawn_fncs(void) {
++#if defined(UV_POSIX_SPAWN_ONLY)
++  posix_spawn_fncs.file_actions.addchdir_np =
++    (int (*)(const posix_spawn_file_actions_t *, const char *))
++      posix_spawn_file_actions_addchdir_np;
++#else
+   /* Try to locate all non-portable functions at runtime */
+   posix_spawn_fncs.file_actions.addchdir_np =
+     dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addchdir_np");
++#endif
+ }
+ 
+ 
+ static void uv__spawn_init_can_use_setsid(void) {
++#if defined(UV_POSIX_SPAWN_ONLY)
++  posix_spawn_can_use_setsid = 1;
++#else
+   int which[] = {CTL_KERN, KERN_OSRELEASE};
+   unsigned major;
+   unsigned minor;
+@@ -454,6 +473,7 @@ static void uv__spawn_init_can_use_setsid(void) {
+     return;
+ 
+   posix_spawn_can_use_setsid = (major >= 19);  /* macOS Catalina */
++#endif
+ }
+ 
+ 
+@@ -500,9 +520,11 @@ static int uv__spawn_set_posix_spawn_attrs(
+    *    spawn-sigmask in attributes
+    * 4) POSIX_SPAWN_SETSID: Make the process a new session leader if a detached
+    *    session was requested. */
+-  flags = POSIX_SPAWN_CLOEXEC_DEFAULT |
+-          POSIX_SPAWN_SETSIGDEF |
++  flags = POSIX_SPAWN_SETSIGDEF |
+           POSIX_SPAWN_SETSIGMASK;
++#if !defined(UV_POSIX_SPAWN_ONLY)
++  flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
++#endif
+   if (options->flags & UV_PROCESS_DETACHED) {
+     /* If running on a version of macOS where this flag is not supported,
+      * revert back to the fork/exec flow. Otherwise posix_spawn will
+@@ -619,7 +641,12 @@ static int uv__spawn_set_posix_spawn_file_actions(
+     }
+ 
+     if (fd == use_fd)
++#if defined(UV_POSIX_SPAWN_ONLY)
++        /* dup2 onto itself clears close-on-exec (musl, glibc >= 2.29) */
++        err = posix_spawn_file_actions_adddup2(actions, fd, fd);
++#else
+         err = posix_spawn_file_actions_addinherit_np(actions, fd);
++#endif
+     else
+         err = posix_spawn_file_actions_adddup2(actions, use_fd, fd);
+     assert(err != ENOSYS);
+@@ -814,7 +841,7 @@ error:
+    * already destroyed, only the happy path requires cleanup */
+   return UV__ERR(err);
+ }
+-#endif
++#endif /* __APPLE__ || UV_POSIX_SPAWN_ONLY */
+ 
+ static int uv__spawn_and_init_child_fork(const uv_process_options_t* options,
+                                          int stdio_count,
+@@ -869,7 +896,7 @@ static int uv__spawn_and_init_child(
+   int exec_errorno;
+   ssize_t r;
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(UV_POSIX_SPAWN_ONLY)
+   uv_once(&posix_spawn_init_once, uv__spawn_init_posix_spawn);
+ 
+   /* Special child process spawn case for macOS Big Sur (11.0) onwards
+@@ -896,6 +923,10 @@ static int uv__spawn_and_init_child(
+    * default back to the fork/execve strategy. For all other errors, just fail. */
+   if (err != UV_ENOSYS)
+     return err;
++#if defined(UV_POSIX_SPAWN_ONLY)
++  /* nothing to fall back to: there is no fork() */
++  return err;
++#endif
+ 
+ #endif
+ 

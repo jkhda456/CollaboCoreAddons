@@ -1,0 +1,1697 @@
+diff --git a/quickjs.c b/quickjs.c
+index 30bf6c8..5de4e9f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -219,7 +219,7 @@ typedef enum JSErrorEnum {
+ 
+ #define JS_MAX_LOCAL_VARS 65535
+ #define JS_STACK_SIZE_MAX 65534
+-#define JS_STRING_LEN_MAX ((1 << 30) - 1)
++#define JS_STRING_LEN_MAX ((1 << 29) - 24) /* node: V8's String::kMaxLength */
+ // 1,024 bytes is about the cutoff point where it starts getting
+ // more profitable to ref slice than to copy
+ #define JS_STRING_SLICE_LEN_MAX 1024 // in bytes
+@@ -390,6 +390,16 @@ struct JSRuntime {
+ 
+     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
+     void *host_promise_rejection_tracker_opaque;
++    /* node: continuation preserved embedder data (AsyncContextFrame) */
++    JSValue cped;
++    /* node: embedder hooks */
++    JSNodeHooks node_hooks;
++    void *node_hooks_opaque;
++    JSClassID node_lazy_stack_class_id;
++    int32_t compile_host_defined_id;
++    /* node: WeakRef targets kept alive until the job ends */
++    JSValue *kept_objects;
++    int kept_count, kept_size;
+ 
+     struct list_head job_list; /* list of JSJobEntry.link */
+ 
+@@ -867,6 +877,7 @@ typedef struct JSFunctionBytecode {
+     uint8_t arguments_allowed : 1;
+     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
+     /* XXX: 5 bits available */
++    int32_t host_defined_id; /* node: the script's host defined options */
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+     JSAtom func_name;
+@@ -1074,6 +1085,7 @@ typedef struct JSJobEntry {
+     struct list_head link;
+     JSContext *ctx;
+     JSJobFunc *job_func;
++    JSValue cped;
+     int argc;
+     JSValue argv[];
+ } JSJobEntry;
+@@ -1215,6 +1227,11 @@ typedef struct JSCallSiteData {
+     bool constructor;
+     int line_num;
+     int col_num;
++    /* node */
++    bool is_async;
++    bool is_toplevel;
++    int enclosing_line;
++    int enclosing_col;
+ } JSCallSiteData;
+ 
+ enum {
+@@ -1558,6 +1575,15 @@ static void js_set_uncatchable_error(JSContext *ctx, JSValueConst val,
+                                      bool flag);
+ 
+ static JSValue js_new_callsite(JSContext *ctx, JSCallSiteData *csd);
++static int32_t js_node_compile_host_defined_id(JSContext *ctx);
++static void js_node_build_lazy_backtrace(JSContext *ctx, JSValueConst error_obj,
++                                         JSValueConst filter_func,
++                                         const char *filename, int line_num,
++                                         int col_num, int backtrace_flags,
++                                         int stack_trace_limit);
++static bool js_node_is_lazy_stack(JSRuntime *rt, JSValueConst val);
++static JSValue js_node_format_lazy_stack(JSContext *ctx, JSValueConst holder,
++                                         JSValueConst error);
+ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFrame *sf);
+ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const char *filename, int line_num, int col_num);
+ static int _JS_AddIntrinsicCallSite(JSContext *ctx);
+@@ -2302,9 +2328,18 @@ static inline uintptr_t js_get_stack_pointer(void)
+ #endif
+ }
+ 
++#if defined(__wasm__)
++#define JS_WASM_STACK_RESERVE 512
++#endif
++
+ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
+ {
+     uintptr_t sp;
++#if defined(__wasm__)
++    char reserve[JS_WASM_STACK_RESERVE];
++    /* the whole array escapes: the compiler cannot shrink it */
++    __asm__ volatile("" : : "r"(reserve) : "memory");
++#endif
+     sp = js_get_stack_pointer() - alloca_size;
+     return unlikely(sp < rt->stack_limit);
+ }
+@@ -2370,6 +2405,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+     JS_UpdateStackTop(rt);
+ 
+     rt->current_exception = JS_UNINITIALIZED;
++    rt->cped = JS_UNDEFINED;
+ 
+     return rt;
+  fail:
+@@ -2500,6 +2536,7 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+         return -1;
+     e->ctx = ctx;
+     e->job_func = job_func;
++    e->cped = js_dup(rt->cped);
+     e->argc = argc;
+     for(i = 0; i < argc; i++) {
+         e->argv[i] = js_dup(argv[i]);
+@@ -2539,7 +2576,13 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+     e = list_entry(rt->job_list.next, JSJobEntry, link);
+     list_del(&e->link);
+     ctx = e->ctx;
+-    res = e->job_func(e->ctx, e->argc, vc(e->argv));
++    {
++        JSValue saved_cped = rt->cped;
++        rt->cped = e->cped;
++        res = e->job_func(e->ctx, e->argc, vc(e->argv));
++        JS_FreeValue(ctx, rt->cped);
++        rt->cped = saved_cped;
++    }
+     for(i = 0; i < e->argc; i++)
+         JS_FreeValue(ctx, e->argv[i]);
+     if (JS_IsException(res))
+@@ -2643,10 +2686,16 @@ void JS_FreeRuntime(JSRuntime *rt)
+     int i;
+ 
+     rt->in_free = true;
++    JS_ClearKeptObjects(rt);
++    js_free_rt(rt, rt->kept_objects);
++    rt->kept_objects = NULL;
+     JS_FreeValueRT(rt, rt->current_exception);
++    JS_FreeValueRT(rt, rt->cped);
++    rt->cped = JS_UNDEFINED;
+ 
+     list_for_each_safe(el, el1, &rt->job_list) {
+         JSJobEntry *e = list_entry(el, JSJobEntry, link);
++        JS_FreeValueRT(rt, e->cped);
+         for(i = 0; i < e->argc; i++)
+             JS_FreeValueRT(rt, e->argv[i]);
+         js_free_rt(rt, e);
+@@ -4155,13 +4204,26 @@ static inline bool JS_IsEmptyString(JSValueConst v)
+ /* JSClass support */
+ 
+ /* a new class ID is allocated if *pclass_id == 0, otherwise *pclass_id is left unchanged */
++static js_once_t js_class_id_once = JS_ONCE_INIT;
++static js_mutex_t js_class_id_mutex;
++static JSClassID js_class_id_alloc_global = JS_CLASS_INIT_COUNT;
++
++static void js_class_id_init(void)
++{
++    js_mutex_init(&js_class_id_mutex);
++}
++
+ JSClassID JS_NewClassID(JSRuntime *rt, JSClassID *pclass_id)
+ {
+-    JSClassID class_id = *pclass_id;
++    JSClassID class_id;
++    js_once(&js_class_id_once, js_class_id_init);
++    js_mutex_lock(&js_class_id_mutex);
++    class_id = *pclass_id;
+     if (class_id == 0) {
+-        class_id = rt->js_class_id_alloc++;
++        class_id = js_class_id_alloc_global++;
+         *pclass_id = class_id;
+     }
++    js_mutex_unlock(&js_class_id_mutex);
+     return class_id;
+ }
+ 
+@@ -4444,7 +4506,7 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
+         return -1;
+ 
+     if (new_len > JS_STRING_LEN_MAX) {
+-        JS_ThrowRangeError(s->ctx, "invalid string length");
++        JS_ThrowRangeError(s->ctx, "Invalid string length");
+         return string_buffer_set_error(s);
+     }
+     new_size = min_int(max_int(new_len, s->size * 3 / 2), JS_STRING_LEN_MAX);
+@@ -4745,7 +4807,7 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
+     /* Compute string kind and length: 7-bit, 8-bit, 16-bit, 16-bit UTF-16 */
+     kind = utf8_scan(buf, buf_len, &len);
+     if (unlikely(len > JS_STRING_LEN_MAX))
+-        return JS_ThrowRangeError(ctx, "invalid string length");
++        return JS_ThrowRangeError(ctx, "Invalid string length");
+ 
+     switch (kind) {
+     case UTF8_PLAIN_ASCII:
+@@ -4782,7 +4844,7 @@ JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len)
+     if (unlikely(!len))
+         return js_empty_string(ctx->rt);
+     if (unlikely(len > JS_STRING_LEN_MAX))
+-        return JS_ThrowRangeError(ctx, "invalid string length");
++        return JS_ThrowRangeError(ctx, "Invalid string length");
+ 
+     str = js_alloc_string(ctx, len, 1);
+     if (unlikely(!str))
+@@ -5247,7 +5309,7 @@ static JSValue js_new_string_rope(JSContext *ctx, JSValue op1, JSValue op2)
+         depth = max_int(depth, r2->depth);
+     }
+     if (len > JS_STRING_LEN_MAX) {
+-        JS_ThrowInternalError(ctx, "string too long");
++        JS_ThrowRangeError(ctx, "Invalid string length");
+         goto fail;
+     }
+     r = js_malloc(ctx, sizeof(*r));
+@@ -5435,7 +5497,7 @@ static JSValue JS_ConcatString1(JSContext *ctx, JSString *p1, JSString *p2)
+ 
+     len = p1->len + p2->len;
+     if (len > JS_STRING_LEN_MAX)
+-        return JS_ThrowRangeError(ctx, "invalid string length");
++        return JS_ThrowRangeError(ctx, "Invalid string length");
+     is_wide_char = p1->is_wide_char | p2->is_wide_char;
+     p = js_alloc_string(ctx, len, is_wide_char);
+     if (!p)
+@@ -8149,6 +8211,30 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
+     return JS_ToCString(ctx, val);
+ }
+ 
++/* node: an own `stack` accessor on an error, as V8 has (Error.prototype's
++   getter and setter) */
++static void js_error_define_own_stack(JSContext *ctx, JSValueConst obj)
++{
++    JSObject *proto;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    JSValue getter, setter;
++
++    if (JS_VALUE_GET_TAG(ctx->class_proto[JS_CLASS_ERROR]) != JS_TAG_OBJECT)
++        return;
++    proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ERROR]);
++    prs = find_own_property(&pr, proto, JS_ATOM_stack);
++    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET)
++        return;
++    getter = pr->u.getset.getter ? JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter) : JS_UNDEFINED;
++    setter = pr->u.getset.setter ? JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter) : JS_UNDEFINED;
++    if (JS_DefineProperty(ctx, obj, JS_ATOM_stack, JS_UNDEFINED, getter, setter,
++                          JS_PROP_HAS_GET | JS_PROP_HAS_SET |
++                          JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
++                          JS_PROP_HAS_ENUMERABLE) < 0)
++        JS_FreeValue(ctx, JS_GetException(ctx));
++}
++
+ /* Note: it is important that no exception is returned by this function */
+ static bool can_add_backtrace(JSValueConst obj)
+ {
+@@ -8228,6 +8314,16 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+     JS_Throw(ctx, saved_exception);
+     saved_exception = JS_UNINITIALIZED;
+ 
++    if (rt->node_hooks.prepare_stack_trace) {
++        /* node: capture the frames now, format on first access (as V8) */
++        js_node_build_lazy_backtrace(ctx, error_obj, filter_func, filename,
++                                     line_num, col_num, backtrace_flags,
++                                     stack_trace_limit);
++        JS_FreeValue(ctx, error_obj);
++        rt->in_build_stack_trace = false;
++        return;
++    }
++
+     stack_trace_limit = min_int(stack_trace_limit, countof(csd));
+     stack_trace_limit = max_int(stack_trace_limit, 0);
+     has_prepare = false;
+@@ -8383,6 +8479,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+         p = JS_VALUE_GET_OBJ(error_obj);
+         JS_FreeValue(ctx, p->u.object_data);
+         p->u.object_data = stack;
++        js_error_define_own_stack(ctx, error_obj);
+     } else if (can_add_backtrace(error_obj)) {
+         /* DOMException and the like keep an own "stack" data property */
+         JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
+@@ -31775,6 +31872,9 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
+         if (JS_IsException(obj))
+             return JS_EXCEPTION;
+         m->meta_obj = obj;
++        if (ctx->rt->node_hooks.init_import_meta &&
++            ctx->rt->node_hooks.init_import_meta(ctx, m, obj, ctx->rt->node_hooks_opaque) < 0)
++            return JS_EXCEPTION;
+     }
+     return js_dup(obj);
+ }
+@@ -32019,6 +32119,24 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+         }
+     }
+ 
++    if (ctx->rt->node_hooks.dynamic_import) {
++        /* node: the embedder resolves and loads; it returns a promise */
++        JSValue p2;
++        int32_t id = 0;
++        JSStackFrame *sf = ctx->rt->current_stack_frame;
++        if (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT &&
++            js_class_has_bytecode(JS_VALUE_GET_OBJ(sf->cur_func)->class_id))
++            id = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode->host_defined_id;
++        p2 = ctx->rt->node_hooks.dynamic_import(ctx, specifier_str, attributes, id,
++                                                 basename_val, ctx->rt->node_hooks_opaque);
++        if (JS_IsException(p2))
++            goto exception;
++        ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, vc(&p2));
++        JS_FreeValue(ctx, ret);
++        JS_FreeValue(ctx, p2);
++        goto done;
++    }
++
+     args[0] = resolving_funcs[0];
+     args[1] = resolving_funcs[1];
+     args[2] = basename_val;
+@@ -37147,6 +37265,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b->super_allowed = fd->super_allowed;
+     b->arguments_allowed = fd->arguments_allowed;
+     b->backtrace_barrier = fd->backtrace_barrier;
++    b->host_defined_id = js_node_compile_host_defined_id(ctx);
+     b->realm = JS_DupContext(ctx);
+ 
+     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+@@ -38257,7 +38376,8 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     /* Could add a flag to avoid resolution if necessary */
+     if (m) {
+         m->func_obj = fun_obj;
+-        if (js_resolve_module(ctx, m) < 0)
++        /* node: the embedder links modules itself (ModuleWrap.link) */
++        if (!ctx->rt->node_hooks.dynamic_import && js_resolve_module(ctx, m) < 0)
+             goto fail1;
+         fun_obj = JS_NewModuleValue(ctx, m);
+     }
+@@ -38337,9 +38457,10 @@ JSValue JS_EvalThis2(JSContext *ctx, JSValueConst this_obj,
+             return JS_ThrowInternalError(ctx, "bad JSEvalOptions version");
+         if (options->filename)
+             filename = options->filename;
+-        if (options->line_num != 0)
+-            line = options->line_num;
+         eval_flags = options->eval_flags;
++        if (options->line_num != 0 || (eval_flags & JS_EVAL_FLAG_NODE_LINE))
++            line = options->line_num;
++        eval_flags &= ~JS_EVAL_FLAG_NODE_LINE;
+     }
+     JSValue ret;
+ 
+@@ -38898,6 +39019,8 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
+     for(i = 0; i < m->req_module_entries_count; i++) {
+         JSReqModuleEntry *rme = &m->req_module_entries[i];
+         bc_put_atom(s, rme->module_name);
++        if (JS_WriteObjectRec(s, rme->attributes))
++            goto fail;
+     }
+ 
+     bc_put_leb128(s, m->export_entries_count);
+@@ -39782,6 +39905,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     if (!b)
+         goto fail;
+ 
++    bc.host_defined_id = js_node_compile_host_defined_id(ctx);
+     memcpy(b, &bc, sizeof(*b));
+     bc.func_name = JS_ATOM_NULL;
+     JS_REF_COUNT(b) = 1;
+@@ -39990,6 +40114,13 @@ static JSValue JS_ReadModule(BCReaderState *s)
+             rme->attributes = JS_UNDEFINED;
+             if (bc_get_atom(s, &rme->module_name))
+                 goto fail;
++            rme->attributes = JS_ReadObjectRec(s);
++            if (JS_IsException(rme->attributes)) {
++                rme->attributes = JS_UNDEFINED;
++                goto fail;
++            }
++            if (s->ctx->rt->node_hooks.dynamic_import)
++                continue;  /* the embedder links it */
+             // Resolves a module either from the cache or by requesting
+             // it from the module loader. From cache is not ideal because
+             // the module may not be the one it was a time of serialization
+@@ -42884,6 +43015,8 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
+     p = JS_VALUE_GET_OBJ(this_val);
+     if (p->class_id != JS_CLASS_ERROR)
+         return JS_UNDEFINED;
++    if (js_node_is_lazy_stack(ctx->rt, p->u.object_data))
++        return js_node_format_lazy_stack(ctx, p->u.object_data, this_val);
+     return js_dup(p->u.object_data);
+ }
+ 
+@@ -42891,13 +43024,19 @@ static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
+                                   JSValueConst value)
+ {
+     int ret, flags;
++    JSObject *p;
+ 
+     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+-    if (!JS_IsString(value))
+-        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter expects a string");
+     if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR]))
+         return JS_ThrowTypeError(ctx, "Error.prototype.stack setter called on the home object");
++    p = JS_VALUE_GET_OBJ(this_val);
++    if (p->class_id == JS_CLASS_ERROR) {
++        /* an error's own stack: any value, as in V8 */
++        JS_FreeValue(ctx, p->u.object_data);
++        p->u.object_data = js_dup(value);
++        return JS_UNDEFINED;
++    }
+     ret = JS_GetOwnPropertyFlagsInternal(ctx, &flags, JS_VALUE_GET_OBJ(this_val),
+                                          JS_ATOM_stack);
+     if (ret < 0)
+@@ -48033,7 +48172,7 @@ static JSValue js_string_pad(JSContext *ctx, JSValueConst this_val,
+         }
+     }
+     if (n > JS_STRING_LEN_MAX) {
+-        JS_ThrowRangeError(ctx, "invalid string length");
++        JS_ThrowRangeError(ctx, "Invalid string length");
+         goto fail3;
+     }
+     if (string_buffer_init(ctx, b, n))
+@@ -48103,7 +48242,7 @@ static JSValue js_string_repeat(JSContext *ctx, JSValueConst this_val,
+     if (len == 0 || val == 1)
+         return str;
+     if (val * len > JS_STRING_LEN_MAX) {
+-        JS_ThrowRangeError(ctx, "string too long");
++        JS_ThrowRangeError(ctx, "Invalid string length");
+         goto fail;
+     }
+     n = val;
+@@ -55520,6 +55659,7 @@ typedef struct JSPromiseReactionData {
+     struct list_head link; /* not used in promise_reaction_job */
+     JSValue resolving_funcs[2];
+     JSValue handler;
++    JSValue cped; /* node: continuation data captured by then() */
+ } JSPromiseReactionData;
+ 
+ JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
+@@ -55587,6 +55727,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
+     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
+     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
+     JS_FreeValueRT(rt, rd->handler);
++    JS_FreeValueRT(rt, rd->cped);
+     js_free_rt(rt, rd);
+ }
+ 
+@@ -55690,7 +55831,13 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
+         args[2] = rd->handler;
+         args[3] = js_bool(is_reject);
+         args[4] = value;
+-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
++        {
++            /* node: the job runs with the data captured when then() was called */
++            JSValue saved_cped = ctx->rt->cped;
++            ctx->rt->cped = rd->cped;
++            JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
++            ctx->rt->cped = saved_cped;
++        }
+         list_del(&rd->link);
+         promise_reaction_data_free(ctx->rt, rd);
+     }
+@@ -55899,6 +56046,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
+             JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
+             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
+             JS_MarkValue(rt, rd->handler, mark_func);
++            JS_MarkValue(rt, rd->cped, mark_func);
+         }
+     }
+     JS_MarkValue(rt, s->promise_result, mark_func);
+@@ -56496,6 +56644,7 @@ static __exception int perform_promise_then(JSContext *ctx,
+         if (!JS_IsFunction(ctx, handler))
+             handler = JS_UNDEFINED;
+         rd->handler = js_dup(handler);
++        rd->cped = js_dup(ctx->rt->cped);
+         rd_array[i] = rd;
+     }
+ 
+@@ -63081,6 +63230,34 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
+     js_free_rt(rt, wr);
+ }
+ 
++static void js_keep_object(JSContext *ctx, JSValueConst v)
++{
++    JSRuntime *rt = ctx->rt;
++    if (rt->kept_count == rt->kept_size) {
++        int n = rt->kept_size ? rt->kept_size * 2 : 16;
++        JSValue *t = js_realloc_rt(rt, rt->kept_objects, n * sizeof(JSValue));
++        if (!t)
++            return;
++        rt->kept_objects = t;
++        rt->kept_size = n;
++    }
++    rt->kept_objects[rt->kept_count++] = js_dup(v);
++}
++
++void JS_ClearKeptObjects(JSRuntime *rt)
++{
++    /* freeing may finalize objects that keep more: take the list first */
++    while (rt->kept_count > 0) {
++        int n = rt->kept_count, i;
++        JSValue *list = rt->kept_objects;
++        rt->kept_objects = NULL;
++        rt->kept_count = rt->kept_size = 0;
++        for (i = 0; i < n; i++)
++            JS_FreeValueRT(rt, list[i]);
++        js_free_rt(rt, list);
++    }
++}
++
+ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+                                       int argc, JSValueConst *argv)
+ {
+@@ -63109,6 +63286,7 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+     wr->kind = JS_WEAK_REF_KIND_WEAK_REF;
+     wr->u.weak_ref_data = wrd;
+     insert_weakref_record(arg, wr);
++    js_keep_object(ctx, arg);
+ 
+     JS_SetOpaqueInternal(obj, wrd);
+     return obj;
+@@ -63121,6 +63299,7 @@ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc,
+         return JS_EXCEPTION;
+     if (wrd == &js_weakref_sentinel)
+         return JS_UNDEFINED;
++    js_keep_object(ctx, wrd->target);
+     return js_dup(wrd->target);
+ }
+ 
+@@ -63523,6 +63702,7 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
+     const char *func_name_str;
+     JSObject *p;
+ 
++    memset(csd, 0, sizeof(*csd));
+     csd->constructor = sf->is_constructor;
+     csd->func = js_dup(sf->cur_func);
+     /* func_name_str is UTF-8 encoded if needed */
+@@ -63560,6 +63740,7 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
+ 
+ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const char *filename, int line_num, int col_num)
+ {
++    memset(csd, 0, sizeof(*csd));
+     csd->func = JS_NULL;
+     csd->func_name = JS_NULL;
+     csd->native = false;
+@@ -63611,6 +63792,63 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int
+     return js_int32(*field);
+ }
+ 
++static JSValue js_callsite_node_misc(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    if (!csd)
++        return JS_EXCEPTION;
++    switch (magic) {
++    case 0: return JS_UNDEFINED;
++    case 1: return JS_NULL;
++    case 2: return JS_AtomToString(ctx, JS_ATOM_empty_string);
++    case 3: return js_int32(0);
++    case 4: return JS_FALSE;
++    case 5: return js_bool(csd->is_async);
++    default: return js_bool(csd->is_toplevel);
++    }
++}
++
++/* the format V8 uses for a frame in Error.prototype.stack */
++static JSValue js_callsite_node_tostring(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    StringBuffer b_s, *b = &b_s;
++    bool has_name;
++    if (!csd)
++        return JS_EXCEPTION;
++    string_buffer_init(ctx, b, 0);
++    has_name = JS_IsString(csd->func_name);
++    if (csd->is_async)
++        string_buffer_puts8(b, "async ");
++    if (csd->constructor) {
++        string_buffer_puts8(b, "new ");
++        if (has_name)
++            string_buffer_concat_value(b, csd->func_name);
++        else
++            string_buffer_puts8(b, "<anonymous>");
++    } else if (has_name) {
++        string_buffer_concat_value(b, csd->func_name);
++    }
++    if (csd->constructor || has_name)
++        string_buffer_puts8(b, " (");
++    if (csd->native) {
++        string_buffer_puts8(b, "native");
++    } else {
++        if (JS_IsString(csd->filename))
++            string_buffer_concat_value(b, csd->filename);
++        else
++            string_buffer_puts8(b, "<anonymous>");
++        if (csd->line_num >= 0) {
++            char buf[32];
++            snprintf(buf, sizeof(buf), ":%d:%d", csd->line_num, csd->col_num);
++            string_buffer_puts8(b, buf);
++        }
++    }
++    if (csd->constructor || has_name)
++        string_buffer_putc8(b, ')');
++    return string_buffer_end(b);
++}
++
+ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
+     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
+     JS_CFUNC_DEF("isConstructor", 0, js_callsite_isconstructor),
+@@ -63619,6 +63857,21 @@ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
+     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
+     JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
+     JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
++    JS_CFUNC_MAGIC_DEF("getEnclosingColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, enclosing_col)),
++    JS_CFUNC_MAGIC_DEF("getEnclosingLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, enclosing_line)),
++    JS_CFUNC_MAGIC_DEF("getScriptNameOrSourceURL", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
++    JS_CFUNC_MAGIC_DEF("getThis", 0, js_callsite_node_misc, 0),
++    JS_CFUNC_MAGIC_DEF("getTypeName", 0, js_callsite_node_misc, 1),
++    JS_CFUNC_MAGIC_DEF("getMethodName", 0, js_callsite_node_misc, 1),
++    JS_CFUNC_MAGIC_DEF("getEvalOrigin", 0, js_callsite_node_misc, 0),
++    JS_CFUNC_MAGIC_DEF("getPromiseIndex", 0, js_callsite_node_misc, 1),
++    JS_CFUNC_MAGIC_DEF("getScriptHash", 0, js_callsite_node_misc, 2),
++    JS_CFUNC_MAGIC_DEF("getPosition", 0, js_callsite_node_misc, 3),
++    JS_CFUNC_MAGIC_DEF("isEval", 0, js_callsite_node_misc, 4),
++    JS_CFUNC_MAGIC_DEF("isPromiseAll", 0, js_callsite_node_misc, 4),
++    JS_CFUNC_MAGIC_DEF("isAsync", 0, js_callsite_node_misc, 5),
++    JS_CFUNC_MAGIC_DEF("isToplevel", 0, js_callsite_node_misc, 6),
++    JS_CFUNC_DEF("toString", 0, js_callsite_node_tostring),
+     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "CallSite", JS_PROP_CONFIGURABLE ),
+ };
+ 
+@@ -64949,3 +65202,960 @@ uintptr_t js_std_cmd(int cmd, ...) {
+ #undef malloc
+ #undef free
+ #undef realloc
++
++
++/* ---- node: lazily formatted stacks (V8's Error.prepareStackTrace model) ---- */
++
++typedef struct JSNodeLazyFrame {
++    JSValue func;
++    int32_t pc;          /* -1 when unknown */
++    bool constructor;
++} JSNodeLazyFrame;
++
++typedef struct JSNodeLazyStack {
++    JSValue formatted;   /* JS_UNINITIALIZED until formatted or set */
++    JSValue first_filename; /* parse errors: the position as first frame */
++    int first_line, first_col;
++    bool has_first;
++    bool formatting;
++    int count;
++    JSNodeLazyFrame frames[];
++} JSNodeLazyStack;
++
++static void js_node_lazy_stack_finalizer(JSRuntime *rt, JSValueConst val)
++{
++    JSNodeLazyStack *ls = JS_GetOpaque(val, rt->node_lazy_stack_class_id);
++    int i;
++    if (!ls)
++        return;
++    JS_FreeValueRT(rt, ls->formatted);
++    JS_FreeValueRT(rt, ls->first_filename);
++    for (i = 0; i < ls->count; i++)
++        JS_FreeValueRT(rt, ls->frames[i].func);
++    js_free_rt(rt, ls);
++}
++
++static void js_node_lazy_stack_mark(JSRuntime *rt, JSValueConst val,
++                                    JS_MarkFunc *mark_func)
++{
++    JSNodeLazyStack *ls = JS_GetOpaque(val, rt->node_lazy_stack_class_id);
++    int i;
++    if (!ls)
++        return;
++    JS_MarkValue(rt, ls->formatted, mark_func);
++    for (i = 0; i < ls->count; i++)
++        JS_MarkValue(rt, ls->frames[i].func, mark_func);
++}
++
++static bool js_node_is_lazy_stack(JSRuntime *rt, JSValueConst val)
++{
++    return rt->node_lazy_stack_class_id != 0 &&
++        JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(val)->class_id == rt->node_lazy_stack_class_id;
++}
++
++static JSValue js_node_lazy_stack_get(JSContext *ctx, JSValueConst this_val,
++                                      int argc, JSValueConst *argv, int magic,
++                                      JSValueConst *func_data)
++{
++    return js_node_format_lazy_stack(ctx, func_data[0], this_val);
++}
++
++static JSValue js_node_lazy_stack_set(JSContext *ctx, JSValueConst this_val,
++                                      int argc, JSValueConst *argv, int magic,
++                                      JSValueConst *func_data)
++{
++    JSNodeLazyStack *ls = JS_GetOpaque(func_data[0], ctx->rt->node_lazy_stack_class_id);
++    if (ls) {
++        JS_FreeValue(ctx, ls->formatted);
++        ls->formatted = js_dup(argc > 0 ? argv[0] : JS_UNDEFINED);
++    }
++    return JS_UNDEFINED;
++}
++
++static JSValue js_node_lazy_stack_callsites(JSContext *ctx, JSNodeLazyStack *ls)
++{
++    JSValue arr = JS_NewArray(ctx);
++    JSCallSiteData csd;
++    uint32_t n = 0;
++    int i;
++    if (JS_IsException(arr))
++        return arr;
++    if (ls->has_first) {
++        memset(&csd, 0, sizeof(csd));
++        csd.func = JS_NULL;
++        csd.func_name = JS_NULL;
++        csd.filename = js_dup(ls->first_filename);
++        csd.line_num = ls->first_line;
++        csd.col_num = ls->first_col;
++        csd.is_toplevel = true;
++        if (JS_DefinePropertyValueUint32(ctx, arr, n++, js_new_callsite(ctx, &csd), JS_PROP_C_W_E) < 0)
++            goto fail;
++    }
++    for (i = 0; i < ls->count; i++) {
++        JSNodeLazyFrame *f = &ls->frames[i];
++        const char *name;
++        JSObject *p;
++        memset(&csd, 0, sizeof(csd));
++        csd.constructor = f->constructor;
++        csd.func = js_dup(f->func);
++        name = get_func_name(ctx, f->func);
++        if (!name || name[0] == '\0' || !strcmp(name, "<eval>"))
++            csd.func_name = JS_NULL;
++        else
++            csd.func_name = JS_NewString(ctx, name);
++        JS_FreeCString(ctx, name);
++        if (JS_IsException(csd.func_name))
++            csd.func_name = JS_NULL;
++        csd.is_toplevel = !f->constructor;
++        p = JS_VALUE_GET_TAG(f->func) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(f->func) : NULL;
++        if (p && js_class_has_bytecode(p->class_id)) {
++            JSFunctionBytecode *b = p->u.func.function_bytecode;
++            int col = 0, line = -1;
++            if (f->pc >= 0 && b->pc2line_buf)
++                line = find_line_num(ctx, b, f->pc, &col);
++            csd.native = false;
++            csd.line_num = line;
++            csd.col_num = col;
++            csd.enclosing_line = b->line_num;
++            csd.enclosing_col = b->col_num;
++            csd.is_async = (b->func_kind & JS_FUNC_ASYNC) != 0 && f->pc >= 0 && false;
++            csd.filename = b->filename ? JS_AtomToString(ctx, b->filename) : JS_NULL;
++            if (JS_IsException(csd.filename)) {
++                csd.filename = JS_NULL;
++                JS_FreeValue(ctx, JS_GetException(ctx));
++            }
++        } else {
++            csd.native = true;
++            csd.line_num = -1;
++            csd.col_num = -1;
++            csd.enclosing_line = -1;
++            csd.enclosing_col = -1;
++            csd.filename = JS_NULL;
++        }
++        if (JS_DefinePropertyValueUint32(ctx, arr, n++, js_new_callsite(ctx, &csd), JS_PROP_C_W_E) < 0)
++            goto fail;
++    }
++    return arr;
++ fail:
++    JS_FreeValue(ctx, arr);
++    return JS_EXCEPTION;
++}
++
++static JSValue js_node_format_lazy_stack(JSContext *ctx, JSValueConst holder,
++                                         JSValueConst error)
++{
++    JSRuntime *rt = ctx->rt;
++    JSNodeLazyStack *ls = JS_GetOpaque(holder, rt->node_lazy_stack_class_id);
++    JSValue callsites, res;
++    if (!ls)
++        return JS_UNDEFINED;
++    if (!JS_IsUninitialized(ls->formatted))
++        return js_dup(ls->formatted);
++    if (ls->formatting || !rt->node_hooks.prepare_stack_trace)
++        return JS_UNDEFINED;
++    callsites = js_node_lazy_stack_callsites(ctx, ls);
++    if (JS_IsException(callsites))
++        return JS_EXCEPTION;
++    ls->formatting = true;
++    res = rt->node_hooks.prepare_stack_trace(ctx, error, callsites, rt->node_hooks_opaque);
++    ls->formatting = false;
++    JS_FreeValue(ctx, callsites);
++    if (JS_IsException(res))
++        return res;
++    if (JS_IsUninitialized(ls->formatted))
++        ls->formatted = js_dup(res);
++    else {
++        /* formatting assigned stack itself; keep that value */
++        JS_FreeValue(ctx, res);
++        res = js_dup(ls->formatted);
++    }
++    return res;
++}
++
++static void js_node_build_lazy_backtrace(JSContext *ctx, JSValueConst error_obj,
++                                         JSValueConst filter_func,
++                                         const char *filename, int line_num,
++                                         int col_num, int backtrace_flags,
++                                         int stack_trace_limit)
++{
++    JSRuntime *rt = ctx->rt;
++    JSStackFrame *sf, *sf_start;
++    JSNodeLazyStack *ls;
++    JSValue holder;
++    int n = 0, limit;
++    bool has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
++
++    if (!rt->node_lazy_stack_class_id) {
++        JSClassDef def = {
++            .class_name = "NodeLazyStack",
++            .finalizer = js_node_lazy_stack_finalizer,
++            .gc_mark = js_node_lazy_stack_mark,
++        };
++        JSClassID id = 0;
++        JS_NewClassID(rt, &id);
++        if (JS_NewClass(rt, id, &def) < 0)
++            return;
++        rt->node_lazy_stack_class_id = id;
++    }
++    limit = stack_trace_limit;
++    if (limit > 200)
++        limit = 200;
++    ls = js_mallocz(ctx, sizeof(*ls) + limit * sizeof(ls->frames[0]));
++    if (!ls)
++        return;
++    ls->formatted = JS_UNINITIALIZED;
++    ls->first_filename = JS_UNDEFINED;
++    if (limit > 0 && filename) {
++        ls->first_filename = JS_NewString(ctx, filename);
++        if (JS_IsException(ls->first_filename)) {
++            ls->first_filename = JS_UNDEFINED;
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        }
++        ls->first_line = line_num;
++        ls->first_col = col_num;
++        ls->has_first = true;
++        limit--;
++    }
++    if (!(filename && (backtrace_flags & JS_BACKTRACE_FLAG_SINGLE_LEVEL))) {
++        sf_start = rt->current_stack_frame;
++        if (has_filter_func && JS_IsFunction(ctx, filter_func)) {
++            /* frames above the topmost call to filter_func, and that call,
++               are left out; none are kept if it is not on the stack */
++            for (sf = sf_start; sf != NULL; sf = sf->prev_frame) {
++                if (js_same_value(ctx, sf->cur_func, filter_func))
++                    break;
++            }
++            sf_start = sf;
++        }
++        for (sf = sf_start; sf != NULL && n < limit; sf = sf->prev_frame) {
++            JSNodeLazyFrame *f;
++            JSObject *p;
++            if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
++                backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
++                continue;
++            }
++            if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++                continue;
++            f = &ls->frames[n++];
++            f->func = js_dup(sf->cur_func);
++            f->constructor = sf->is_constructor;
++            f->pc = -1;
++            p = JS_VALUE_GET_OBJ(sf->cur_func);
++            if (js_class_has_bytecode(p->class_id)) {
++                JSFunctionBytecode *b = p->u.func.function_bytecode;
++                if (sf->cur_pc)
++                    f->pc = sf->cur_pc - b->byte_code_buf - 1;
++                if (b->backtrace_barrier)
++                    break;
++            }
++        }
++    }
++    ls->count = n;
++    holder = JS_NewObjectClass(ctx, rt->node_lazy_stack_class_id);
++    if (JS_IsException(holder)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        ls->count = 0;
++        for (n = 0; n < ls->count; n++)
++            JS_FreeValue(ctx, ls->frames[n].func);
++        JS_FreeValue(ctx, ls->first_filename);
++        js_free(ctx, ls);
++        return;
++    }
++    JS_SetOpaque(holder, ls);
++
++    if (JS_IsUndefined(ctx->error_back_trace))
++        ctx->error_back_trace = js_dup(holder);
++    if (has_filter_func || can_add_backtrace(error_obj)) {
++        JSValue getter, setter;
++        getter = JS_NewCFunctionData(ctx, js_node_lazy_stack_get, 0, 0, 1, vc(&holder));
++        setter = JS_NewCFunctionData(ctx, js_node_lazy_stack_set, 1, 0, 1, vc(&holder));
++        if (JS_DefineProperty(ctx, error_obj, JS_ATOM_stack, JS_UNDEFINED,
++                              getter, setter,
++                              JS_PROP_HAS_GET | JS_PROP_HAS_SET |
++                              JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
++                              JS_PROP_HAS_ENUMERABLE) < 0)
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        JS_FreeValue(ctx, getter);
++        JS_FreeValue(ctx, setter);
++        JS_FreeValue(ctx, holder);
++    } else if (can_store_error_stack(error_obj)) {
++        JSObject *p = JS_VALUE_GET_OBJ(error_obj);
++        JS_FreeValue(ctx, p->u.object_data);
++        p->u.object_data = holder;
++        js_error_define_own_stack(ctx, error_obj);
++    } else {
++        JS_FreeValue(ctx, holder);
++    }
++}
++
++void JS_SetNodeHooks(JSRuntime *rt, const JSNodeHooks *hooks, void *opaque)
++{
++    rt->node_hooks = *hooks;
++    rt->node_hooks_opaque = opaque;
++}
++
++JSValue JS_GetErrorStackValue(JSContext *ctx, JSValueConst error)
++{
++    /* the stack as `error.stack` would read it, without running getters
++       of a Proxy; returns undefined when there is none */
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
++        return JS_UNDEFINED;
++    p = JS_VALUE_GET_OBJ(error);
++    if (p->class_id == JS_CLASS_ERROR && js_node_is_lazy_stack(ctx->rt, p->u.object_data))
++        return js_node_format_lazy_stack(ctx, p->u.object_data, error);
++    return JS_GetProperty(ctx, error, JS_ATOM_stack);
++}
++
++
++/* ---- node: host defined options and the module API ModuleWrap needs ---- */
++
++int32_t JS_SetCompileHostDefinedId(JSRuntime *rt, int32_t id)
++{
++    int32_t old = rt->compile_host_defined_id;
++    rt->compile_host_defined_id = id;
++    return old;
++}
++
++/* explicit id (> 0), none (< 0), or inherited from the calling script
++   (0: eval(), new Function()) */
++static int32_t js_node_compile_host_defined_id(JSContext *ctx)
++{
++    JSRuntime *rt = ctx->rt;
++    JSStackFrame *sf;
++    if (rt->compile_host_defined_id > 0)
++        return rt->compile_host_defined_id;
++    if (rt->compile_host_defined_id < 0)
++        return 0;
++    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
++        if (JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT &&
++            js_class_has_bytecode(JS_VALUE_GET_OBJ(sf->cur_func)->class_id))
++            return JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode->host_defined_id;
++    }
++    return 0;
++}
++
++int32_t JS_GetFunctionHostDefinedId(JSContext *ctx, JSValueConst func)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(func) == JS_TAG_FUNCTION_BYTECODE)
++        return ((JSFunctionBytecode *)JS_VALUE_GET_PTR(func))->host_defined_id;
++    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(func);
++    if (!js_class_has_bytecode(p->class_id))
++        return 0;
++    return p->u.func.function_bytecode->host_defined_id;
++}
++
++JSModuleDef *JS_GetModuleDef(JSValueConst val)
++{
++    if (JS_VALUE_GET_TAG(val) != JS_TAG_MODULE)
++        return NULL;
++    return JS_VALUE_GET_PTR(val);
++}
++
++JSValue JS_NewModuleRef(JSContext *ctx, JSModuleDef *m)
++{
++    return js_dup(JS_MKPTR(JS_TAG_MODULE, m));
++}
++
++int JS_GetModuleRequestCount(JSModuleDef *m)
++{
++    return m->req_module_entries_count;
++}
++
++JSValue JS_GetModuleRequestSpecifier(JSContext *ctx, JSModuleDef *m, int i)
++{
++    if (i < 0 || i >= m->req_module_entries_count)
++        return JS_UNDEFINED;
++    return JS_AtomToString(ctx, m->req_module_entries[i].module_name);
++}
++
++JSValue JS_GetModuleRequestAttributes(JSContext *ctx, JSModuleDef *m, int i)
++{
++    if (i < 0 || i >= m->req_module_entries_count)
++        return JS_UNDEFINED;
++    return js_dup(m->req_module_entries[i].attributes);
++}
++
++void JS_SetModuleRequestModule(JSModuleDef *m, int i, JSModuleDef *target)
++{
++    if (i >= 0 && i < m->req_module_entries_count)
++        m->req_module_entries[i].module = target;
++}
++
++JSModuleDef *JS_GetModuleRequestModule(JSModuleDef *m, int i)
++{
++    if (i < 0 || i >= m->req_module_entries_count)
++        return NULL;
++    return m->req_module_entries[i].module;
++}
++
++/* every request of m and of the modules it links to must have its module
++   set; m is then marked resolved so the loader is never asked */
++static int js_node_mark_resolved(JSContext *ctx, JSModuleDef *m)
++{
++    int i;
++    if (m->resolved)
++        return 0;
++    for (i = 0; i < m->req_module_entries_count; i++) {
++        if (!m->req_module_entries[i].module) {
++            JSValue name = JS_AtomToString(ctx, m->req_module_entries[i].module_name);
++            const char *str = JS_ToCString(ctx, name);
++            JS_ThrowReferenceError(ctx, "request for '%s' is not yet linked", str ? str : "?");
++            JS_FreeCString(ctx, str);
++            JS_FreeValue(ctx, name);
++            return -1;
++        }
++    }
++    m->resolved = true;
++    for (i = 0; i < m->req_module_entries_count; i++) {
++        if (js_node_mark_resolved(ctx, m->req_module_entries[i].module) < 0) {
++            m->resolved = false;
++            return -1;
++        }
++    }
++    return 0;
++}
++
++int JS_InstantiateModule(JSContext *ctx, JSModuleDef *m)
++{
++    if (js_node_mark_resolved(ctx, m) < 0)
++        return -1;
++    if (js_create_module_function(ctx, m) < 0)
++        return -1;
++    return js_link_module(ctx, m);
++}
++
++/* the evaluation promise (module capability), or an exception */
++JSValue JS_EvaluateModule(JSContext *ctx, JSModuleDef *m)
++{
++    if (m->status == JS_MODULE_STATUS_UNLINKED) {
++        if (JS_InstantiateModule(ctx, m) < 0)
++            return JS_EXCEPTION;
++    }
++    return js_evaluate_module(ctx, m);
++}
++
++/* 0 unlinked, 1 linking, 2 linked, 3 evaluating, 4 evaluating-async,
++   5 evaluated (6: evaluated with an error) */
++int JS_GetModuleStatus(JSModuleDef *m)
++{
++    if (m->status == JS_MODULE_STATUS_EVALUATED && m->eval_has_exception)
++        return 6;
++    return m->status;
++}
++
++JSValue JS_GetModuleException(JSContext *ctx, JSModuleDef *m)
++{
++    if (!m->eval_has_exception)
++        return JS_UNDEFINED;
++    return js_dup(m->eval_exception);
++}
++
++bool JS_ModuleHasTLA(JSModuleDef *m)
++{
++    return m->has_tla;
++}
++
++static bool js_node_graph_async(JSModuleDef *m, int depth)
++{
++    int i;
++    if (m->has_tla)
++        return true;
++    if (depth > 10000)
++        return false;
++    for (i = 0; i < m->req_module_entries_count; i++) {
++        JSModuleDef *m1 = m->req_module_entries[i].module;
++        if (m1 && m1 != m && js_node_graph_async(m1, depth + 1))
++            return true;
++    }
++    return false;
++}
++
++bool JS_ModuleIsGraphAsync(JSModuleDef *m)
++{
++    return js_node_graph_async(m, 0);
++}
++
++int32_t JS_GetModuleHostDefinedId(JSModuleDef *m)
++{
++    return JS_GetFunctionHostDefinedId(NULL, m->func_obj);
++}
++
++int JS_GetModuleExportNames(JSContext *ctx, JSModuleDef *m, JSValue *names_array)
++{
++    JSValue arr = JS_NewArray(ctx);
++    int i;
++    if (JS_IsException(arr))
++        return -1;
++    for (i = 0; i < m->export_entries_count; i++) {
++        if (JS_DefinePropertyValueUint32(ctx, arr, i,
++                JS_AtomToString(ctx, m->export_entries[i].export_name), JS_PROP_C_W_E) < 0) {
++            JS_FreeValue(ctx, arr);
++            return -1;
++        }
++    }
++    *names_array = arr;
++    return 0;
++}
++
++/* the continuation preserved embedder data */
++JSValue JS_GetContinuationPreservedData(JSContext *ctx)
++{
++    return js_dup(ctx->rt->cped);
++}
++
++void JS_SetContinuationPreservedData(JSContext *ctx, JSValue val)
++{
++    JS_FreeValue(ctx, ctx->rt->cped);
++    ctx->rt->cped = val;
++}
++
++
++/* ---- node: introspection for internalBinding('types') and ('util') ---- */
++
++uint32_t JS_NodeTypeFlags(JSValueConst v)
++{
++    JSObject *p;
++    uint32_t f = 0;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(v);
++    switch (p->class_id) {
++    case JS_CLASS_ARGUMENTS:
++    case JS_CLASS_MAPPED_ARGUMENTS: f |= JS_NODE_TYPE_ARGUMENTS; break;
++    case JS_CLASS_ASYNC_FUNCTION: f |= JS_NODE_TYPE_ASYNC_FUNCTION; break;
++    case JS_CLASS_GENERATOR_FUNCTION: f |= JS_NODE_TYPE_GENERATOR_FUNCTION; break;
++    case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
++        f |= JS_NODE_TYPE_ASYNC_FUNCTION | JS_NODE_TYPE_GENERATOR_FUNCTION; break;
++    case JS_CLASS_GENERATOR:
++    case JS_CLASS_ASYNC_GENERATOR: f |= JS_NODE_TYPE_GENERATOR_OBJECT; break;
++    case JS_CLASS_MAP_ITERATOR: f |= JS_NODE_TYPE_MAP_ITERATOR; break;
++    case JS_CLASS_SET_ITERATOR: f |= JS_NODE_TYPE_SET_ITERATOR; break;
++    case JS_CLASS_MODULE_NS: f |= JS_NODE_TYPE_MODULE_NAMESPACE; break;
++    case JS_CLASS_NUMBER: f |= JS_NODE_TYPE_NUMBER_OBJECT; break;
++    case JS_CLASS_STRING: f |= JS_NODE_TYPE_STRING_OBJECT; break;
++    case JS_CLASS_BOOLEAN: f |= JS_NODE_TYPE_BOOLEAN_OBJECT; break;
++    case JS_CLASS_SYMBOL: f |= JS_NODE_TYPE_SYMBOL_OBJECT; break;
++    case JS_CLASS_BIG_INT: f |= JS_NODE_TYPE_BIGINT_OBJECT; break;
++    case JS_CLASS_DATE: f |= JS_NODE_TYPE_DATE; break;
++    case JS_CLASS_REGEXP: f |= JS_NODE_TYPE_REGEXP; break;
++    case JS_CLASS_ERROR: f |= JS_NODE_TYPE_NATIVE_ERROR; break;
++    case JS_CLASS_MAP: f |= JS_NODE_TYPE_MAP; break;
++    case JS_CLASS_SET: f |= JS_NODE_TYPE_SET; break;
++    case JS_CLASS_WEAKMAP: f |= JS_NODE_TYPE_WEAKMAP; break;
++    case JS_CLASS_WEAKSET: f |= JS_NODE_TYPE_WEAKSET; break;
++    case JS_CLASS_PROMISE: f |= JS_NODE_TYPE_PROMISE; break;
++    case JS_CLASS_PROXY: f |= JS_NODE_TYPE_PROXY; break;
++    case JS_CLASS_ARRAY_BUFFER: f |= JS_NODE_TYPE_ARRAY_BUFFER; break;
++    case JS_CLASS_SHARED_ARRAY_BUFFER: f |= JS_NODE_TYPE_SHARED_ARRAY_BUFFER; break;
++    case JS_CLASS_DATAVIEW: f |= JS_NODE_TYPE_DATA_VIEW; break;
++    case JS_CLASS_WEAK_REF: f |= JS_NODE_TYPE_WEAK_REF; break;
++    case JS_CLASS_C_FUNCTION:
++    case JS_CLASS_C_FUNCTION_DATA:
++    case JS_CLASS_C_CLOSURE: f |= JS_NODE_TYPE_NATIVE_FUNCTION; break;
++    default:
++        break;
++    }
++    if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY)
++        f |= JS_NODE_TYPE_TYPED_ARRAY;
++    return f;
++}
++
++/* Map/Set/WeakMap/WeakSet and their iterators: the entries as an array,
++   key/value pairs flattened when *is_key_value */
++JSValue JS_NodePreviewEntries(JSContext *ctx, JSValueConst obj, bool *is_key_value)
++{
++    JSObject *p;
++    JSMapState *s;
++    JSMapRecord *mr;
++    struct list_head *el;
++    JSValue arr;
++    uint32_t n = 0;
++    int kind = 2; /* 0 keys, 1 values, 2 entries */
++    bool is_set = false;
++
++    *is_key_value = false;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return JS_UNDEFINED;
++    p = JS_VALUE_GET_OBJ(obj);
++    el = NULL;
++    switch (p->class_id) {
++    case JS_CLASS_MAP:
++    case JS_CLASS_WEAKMAP:
++        s = p->u.map_state;
++        kind = 2;
++        break;
++    case JS_CLASS_SET:
++    case JS_CLASS_WEAKSET:
++        s = p->u.map_state;
++        is_set = true;
++        kind = 0;
++        break;
++    case JS_CLASS_MAP_ITERATOR:
++    case JS_CLASS_SET_ITERATOR:
++        {
++            JSMapIteratorData *it = p->u.map_iterator_data;
++            if (!it || JS_IsUndefined(it->obj))
++                return JS_NewArray(ctx);
++            s = JS_VALUE_GET_OBJ(it->obj)->u.map_state;
++            is_set = p->class_id == JS_CLASS_SET_ITERATOR;
++            kind = it->kind == JS_ITERATOR_KIND_KEY ? 0 :
++                it->kind == JS_ITERATOR_KIND_VALUE ? 1 : 2;
++            if (is_set && kind == 1)
++                kind = 0;
++            if (it->cur_record)
++                el = it->cur_record->link.next;
++        }
++        break;
++    default:
++        return JS_UNDEFINED;
++    }
++    if (!s)
++        return JS_UNDEFINED;
++    if (!el)
++        el = s->records.next;
++    arr = JS_NewArray(ctx);
++    if (JS_IsException(arr))
++        return arr;
++    for (; el != &s->records; el = el->next) {
++        mr = list_entry(el, JSMapRecord, link);
++        if (mr->empty)
++            continue;
++        if (s->is_weak && JS_IsUndefined(mr->key))
++            continue;
++        if (kind == 0 || kind == 2) {
++            if (JS_DefinePropertyValueUint32(ctx, arr, n++, js_dup(mr->key), JS_PROP_C_W_E) < 0)
++                goto fail;
++        }
++        if (!is_set && (kind == 1 || kind == 2)) {
++            if (JS_DefinePropertyValueUint32(ctx, arr, n++, js_dup(mr->value), JS_PROP_C_W_E) < 0)
++                goto fail;
++        }
++        if (is_set && kind == 2) {
++            if (JS_DefinePropertyValueUint32(ctx, arr, n++, js_dup(mr->key), JS_PROP_C_W_E) < 0)
++                goto fail;
++        }
++    }
++    *is_key_value = (kind == 2);
++    return arr;
++ fail:
++    JS_FreeValue(ctx, arr);
++    return JS_EXCEPTION;
++}
++
++/* a flat string's characters (8-bit Latin-1 or 16-bit UTF-16); *pval is
++   replaced by a flat string if it was a rope */
++const void *JS_NodeStringData(JSContext *ctx, JSValue *pval, uint32_t *plen, int *pwide)
++{
++    JSString *p;
++    if (JS_VALUE_GET_TAG(*pval) == JS_TAG_STRING_ROPE) {
++        JSValue flat = js_linearize_string_rope(ctx, *pval);
++        if (JS_IsException(flat))
++            return NULL;
++        JS_FreeValue(ctx, *pval);
++        *pval = flat;
++    }
++    if (JS_VALUE_GET_TAG(*pval) != JS_TAG_STRING)
++        return NULL;
++    p = JS_VALUE_GET_STRING(*pval);
++    *plen = p->len;
++    *pwide = p->is_wide_char;
++    return strv(p);
++}
++
++/* a new string from Latin-1 bytes (no UTF-8 decoding) */
++JSValue JS_NodeNewStringLatin1(JSContext *ctx, const uint8_t *buf, size_t len)
++{
++    JSString *str;
++    if (len > JS_STRING_LEN_MAX)
++        return JS_ThrowRangeError(ctx, "Invalid string length");
++    str = js_alloc_string(ctx, len, 0);
++    if (!str)
++        return JS_EXCEPTION;
++    memcpy(str8(str), buf, len);
++    str8(str)[len] = '\0';
++    return JS_MKPTR(JS_TAG_STRING, str);
++}
++
++/* a new string from UTF-16 code units, narrowed when they all fit in 8 bits */
++JSValue JS_NodeNewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len)
++{
++    JSString *str;
++    size_t i;
++    uint16_t c = 0;
++    if (len > JS_STRING_LEN_MAX)
++        return JS_ThrowRangeError(ctx, "Invalid string length");
++    for (i = 0; i < len; i++)
++        c |= buf[i];
++    if (c < 0x100) {
++        str = js_alloc_string(ctx, len, 0);
++        if (!str)
++            return JS_EXCEPTION;
++        for (i = 0; i < len; i++)
++            str8(str)[i] = buf[i];
++        str8(str)[len] = '\0';
++    } else {
++        str = js_alloc_string(ctx, len, 1);
++        if (!str)
++            return JS_EXCEPTION;
++        memcpy(str16(str), buf, len * 2);
++    }
++    return JS_MKPTR(JS_TAG_STRING, str);
++}
++
++/* a new string with uninitialized contents, to be filled through the
++   returned pointer (8-bit when !wide) */
++JSValue JS_NodeNewStringRaw(JSContext *ctx, size_t len, int wide, void **pdata)
++{
++    JSString *str;
++    if (len > JS_STRING_LEN_MAX)
++        return JS_ThrowRangeError(ctx, "Invalid string length");
++    str = js_alloc_string(ctx, len, wide);
++    if (!str)
++        return JS_EXCEPTION;
++    if (!wide)
++        str8(str)[len] = '\0';
++    *pdata = strv(str);
++    return JS_MKPTR(JS_TAG_STRING, str);
++}
++
++bool JS_NodeIsConstructor(JSContext *ctx, JSValueConst v)
++{
++    return JS_IsConstructor(ctx, v);
++}
++
++/* the stack frames of the running code: function names and positions, for
++   util.getCallSites() and the like */
++int JS_NodeCurrentFrameCount(JSContext *ctx)
++{
++    JSStackFrame *sf;
++    int n = 0;
++    for (sf = ctx->rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
++        n++;
++    return n;
++}
++
++
++/* node: where an exception was thrown or an error created: the first frame
++   with a source position of the error's captured stack, or of the backtrace
++   recorded when a non-error value was thrown.  Returns 0 when found. */
++int JS_NodeGetExceptionPosition(JSContext *ctx, JSValueConst exc,
++                                JSValue *pfilename, int *pline, int *pcol)
++{
++    JSRuntime *rt = ctx->rt;
++    JSValueConst holder = JS_UNDEFINED;
++    JSNodeLazyStack *ls;
++    int i;
++
++    *pfilename = JS_UNDEFINED;
++    *pline = -1;
++    *pcol = -1;
++    if (JS_VALUE_GET_TAG(exc) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(exc)->class_id == JS_CLASS_ERROR &&
++        js_node_is_lazy_stack(rt, JS_VALUE_GET_OBJ(exc)->u.object_data))
++        holder = JS_VALUE_GET_OBJ(exc)->u.object_data;
++    else if (js_node_is_lazy_stack(rt, ctx->error_back_trace))
++        holder = ctx->error_back_trace;
++    ls = JS_GetOpaque(holder, rt->node_lazy_stack_class_id);
++    if (!ls)
++        return -1;
++    if (ls->has_first) {
++        *pfilename = js_dup(ls->first_filename);
++        *pline = ls->first_line;
++        *pcol = ls->first_col;
++        return 0;
++    }
++    for (i = 0; i < ls->count; i++) {
++        JSNodeLazyFrame *f = &ls->frames[i];
++        JSObject *p;
++        if (JS_VALUE_GET_TAG(f->func) != JS_TAG_OBJECT)
++            continue;
++        p = JS_VALUE_GET_OBJ(f->func);
++        if (js_class_has_bytecode(p->class_id) && f->pc >= 0) {
++            JSFunctionBytecode *b = p->u.func.function_bytecode;
++            int col = 0, line = -1;
++            if (b->pc2line_buf)
++                line = find_line_num(ctx, b, f->pc, &col);
++            if (line < 0 || !b->filename)
++                continue;
++            *pfilename = JS_AtomToString(ctx, b->filename);
++            *pline = line;
++            *pcol = col;
++            return 0;
++        }
++    }
++    return -1;
++}
++
++/* forget the backtrace of the last thrown value (after it was handled) */
++void JS_NodeClearBacktrace(JSContext *ctx)
++{
++    JS_FreeValue(ctx, ctx->error_back_trace);
++    ctx->error_back_trace = JS_UNDEFINED;
++}
++
++
++/* node: the bytes of an ArrayBuffer, SharedArrayBuffer, typed array or
++   DataView without copying; NULL (and no exception) for anything else */
++uint8_t *JS_NodeGetBufferBytes(JSContext *ctx, JSValueConst v, size_t *plen)
++{
++    static uint8_t empty[1];
++    JSObject *p;
++    JSArrayBuffer *abuf;
++    JSTypedArray *ta;
++    size_t len;
++
++    *plen = 0;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return NULL;
++    p = JS_VALUE_GET_OBJ(v);
++    switch (p->class_id) {
++    case JS_CLASS_ARRAY_BUFFER:
++    case JS_CLASS_SHARED_ARRAY_BUFFER:
++        abuf = p->u.array_buffer;
++        if (abuf->detached || !abuf->data)
++            return empty;
++        *plen = abuf->byte_length;
++        return abuf->data;
++    case JS_CLASS_DATAVIEW:
++    case JS_CLASS_UINT8C_ARRAY:
++    case JS_CLASS_INT8_ARRAY:
++    case JS_CLASS_UINT8_ARRAY:
++    case JS_CLASS_INT16_ARRAY:
++    case JS_CLASS_UINT16_ARRAY:
++    case JS_CLASS_INT32_ARRAY:
++    case JS_CLASS_UINT32_ARRAY:
++    case JS_CLASS_BIG_INT64_ARRAY:
++    case JS_CLASS_BIG_UINT64_ARRAY:
++    case JS_CLASS_FLOAT16_ARRAY:
++    case JS_CLASS_FLOAT32_ARRAY:
++    case JS_CLASS_FLOAT64_ARRAY:
++        ta = p->u.typed_array;
++        abuf = ta->buffer->u.array_buffer;
++        if (abuf->detached || !abuf->data)
++            return empty;
++        if (ta->offset > (uint32_t)abuf->byte_length)
++            return empty;
++        if (ta->track_rab)
++            len = abuf->byte_length - ta->offset;
++        else
++            len = ta->length;
++        if (ta->offset + len > (size_t)abuf->byte_length)
++            len = abuf->byte_length - ta->offset;
++        *plen = len;
++        return abuf->data + ta->offset;
++    default:
++        return NULL;
++    }
++}
++
++/* the ArrayBuffer under a typed array or DataView (dup), with its window */
++JSValue JS_NodeGetViewBuffer(JSContext *ctx, JSValueConst v, size_t *poffset, size_t *plen)
++{
++    JSObject *p;
++    JSTypedArray *ta;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return JS_UNDEFINED;
++    p = JS_VALUE_GET_OBJ(v);
++    if (!(p->class_id == JS_CLASS_DATAVIEW ||
++          (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY)))
++        return JS_UNDEFINED;
++    ta = p->u.typed_array;
++    *poffset = ta->offset;
++    JS_NodeGetBufferBytes(ctx, v, plen);
++    return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
++}
++
++bool JS_NodeIsSharedArrayBuffer(JSValueConst v)
++{
++    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_SHARED_ARRAY_BUFFER;
++}
++
++bool JS_NodeIsArrayBufferView(JSValueConst v)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return false;
++    p = JS_VALUE_GET_OBJ(v);
++    return p->class_id == JS_CLASS_DATAVIEW ||
++        (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY);
++}
++
++
++/* node: CallSite objects for the running code, skipping `skip` frames */
++JSValue JS_NodeCaptureCallSites(JSContext *ctx, int skip, int limit)
++{
++    JSRuntime *rt = ctx->rt;
++    JSStackFrame *sf;
++    JSNodeLazyStack *ls;
++    JSValue arr;
++    int n = 0, i;
++    if (limit < 0)
++        limit = 0;
++    if (limit > 1000)
++        limit = 1000;
++    ls = js_mallocz(ctx, sizeof(*ls) + limit * sizeof(ls->frames[0]));
++    if (!ls)
++        return JS_EXCEPTION;
++    ls->formatted = JS_UNINITIALIZED;
++    ls->first_filename = JS_UNDEFINED;
++    for (sf = rt->current_stack_frame; sf != NULL && n < limit; sf = sf->prev_frame) {
++        JSNodeLazyFrame *f;
++        JSObject *p;
++        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++            continue;
++        if (skip > 0) {
++            skip--;
++            continue;
++        }
++        f = &ls->frames[n++];
++        f->func = js_dup(sf->cur_func);
++        f->constructor = sf->is_constructor;
++        f->pc = -1;
++        p = JS_VALUE_GET_OBJ(sf->cur_func);
++        if (js_class_has_bytecode(p->class_id) && sf->cur_pc)
++            f->pc = sf->cur_pc - p->u.func.function_bytecode->byte_code_buf - 1;
++    }
++    ls->count = n;
++    arr = js_node_lazy_stack_callsites(ctx, ls);
++    for (i = 0; i < n; i++)
++        JS_FreeValue(ctx, ls->frames[i].func);
++    js_free(ctx, ls);
++    return arr;
++}
++
++
++/* node: true when input parses as a module (nothing is kept); the parse
++   error stays pending when it does not */
++int JS_NodeCheckModuleSyntax(JSContext *ctx, const char *input, size_t input_len,
++                             const char *filename)
++{
++    JSValue v;
++    JSModuleDef *m;
++    v = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, filename, 1,
++                          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY, -1);
++    if (JS_IsException(v))
++        return 0;
++    m = JS_VALUE_GET_PTR(v);
++    JS_FreeValue(ctx, v);
++    js_free_module_def(ctx, m);
++    return 1;
++}
++
++/* drop a module that failed or is no longer wanted */
++void JS_NodeFreeModule(JSContext *ctx, JSModuleDef *m)
++{
++    js_free_module_def(ctx, m);
++}
++
++
++/* node: a + b for two strings (both freed) */
++JSValue JS_NodeConcatStrings(JSContext *ctx, JSValue a, JSValue b)
++{
++    return JS_ConcatString(ctx, a, b);
++}
+diff --git a/quickjs.h b/quickjs.h
+index 7db4021..de139dd 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -454,6 +454,8 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
+ 
+ #define JS_EVAL_FLAG_STRICT   (1 << 3) /* force 'strict' mode */
+ #define JS_EVAL_FLAG_UNUSED   (1 << 4) /* unused */
++/* node: JSEvalOptions.line_num is used as is, 0 included */
++#define JS_EVAL_FLAG_NODE_LINE JS_EVAL_FLAG_UNUSED
+ /* compile but do not run. The result is an object with a
+    JS_TAG_FUNCTION_BYTECODE or JS_TAG_MODULE tag. It can be executed
+    with JS_EvalFunction(). */
+@@ -1456,8 +1458,105 @@ JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *exp
+ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
+                                      const JSCFunctionListEntry *tab, int len);
+ 
++/* Node.js embedding (collaboCore): hooks and internals Node's bindings need */
++
++typedef struct JSNodeHooks {
++    /* formats error.stack on first access; callsites is an array of CallSite */
++    JSValue (*prepare_stack_trace)(JSContext *ctx, JSValueConst error,
++                                   JSValueConst callsites, void *opaque);
++    /* import(): returns a promise for the namespace */
++    JSValue (*dynamic_import)(JSContext *ctx, JSValueConst specifier,
++                              JSValueConst attributes, int32_t host_defined_id,
++                              JSValueConst referrer_name, void *opaque);
++    /* called once when a module's import.meta is created */
++    int (*init_import_meta)(JSContext *ctx, JSModuleDef *m, JSValueConst meta,
++                            void *opaque);
++} JSNodeHooks;
++
++JS_EXTERN void JS_SetNodeHooks(JSRuntime *rt, const JSNodeHooks *hooks, void *opaque);
++/* node: the end of a job (microtask checkpoint): WeakRef targets kept
++   since the job started may go */
++JS_EXTERN void JS_ClearKeptObjects(JSRuntime *rt);
++JS_EXTERN JSValue JS_GetErrorStackValue(JSContext *ctx, JSValueConst error);
++
++/* host defined options of compiled code: > 0 an id, < 0 none, 0 inherited
++   from the calling script; returns the previous setting */
++JS_EXTERN int32_t JS_SetCompileHostDefinedId(JSRuntime *rt, int32_t id);
++JS_EXTERN int32_t JS_GetFunctionHostDefinedId(JSContext *ctx, JSValueConst func);
++
++/* modules, for an embedder that links them itself */
++JS_EXTERN JSModuleDef *JS_GetModuleDef(JSValueConst val);
++JS_EXTERN JSValue JS_NewModuleRef(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN int JS_GetModuleRequestCount(JSModuleDef *m);
++JS_EXTERN JSValue JS_GetModuleRequestSpecifier(JSContext *ctx, JSModuleDef *m, int i);
++JS_EXTERN JSValue JS_GetModuleRequestAttributes(JSContext *ctx, JSModuleDef *m, int i);
++JS_EXTERN void JS_SetModuleRequestModule(JSModuleDef *m, int i, JSModuleDef *target);
++JS_EXTERN JSModuleDef *JS_GetModuleRequestModule(JSModuleDef *m, int i);
++JS_EXTERN int JS_InstantiateModule(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN JSValue JS_EvaluateModule(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN int JS_GetModuleStatus(JSModuleDef *m);
++JS_EXTERN JSValue JS_GetModuleException(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN bool JS_ModuleHasTLA(JSModuleDef *m);
++JS_EXTERN bool JS_ModuleIsGraphAsync(JSModuleDef *m);
++JS_EXTERN int32_t JS_GetModuleHostDefinedId(JSModuleDef *m);
++JS_EXTERN int JS_GetModuleExportNames(JSContext *ctx, JSModuleDef *m, JSValue *names_array);
++
++/* V8's continuation preserved embedder data: follows promise reactions */
++JS_EXTERN JSValue JS_GetContinuationPreservedData(JSContext *ctx);
++JS_EXTERN void JS_SetContinuationPreservedData(JSContext *ctx, JSValue val);
++
++enum {
++    JS_NODE_TYPE_ARGUMENTS           = 1 << 0,
++    JS_NODE_TYPE_ASYNC_FUNCTION      = 1 << 1,
++    JS_NODE_TYPE_GENERATOR_FUNCTION  = 1 << 2,
++    JS_NODE_TYPE_GENERATOR_OBJECT    = 1 << 3,
++    JS_NODE_TYPE_MAP_ITERATOR        = 1 << 4,
++    JS_NODE_TYPE_SET_ITERATOR        = 1 << 5,
++    JS_NODE_TYPE_MODULE_NAMESPACE    = 1 << 6,
++    JS_NODE_TYPE_NUMBER_OBJECT       = 1 << 7,
++    JS_NODE_TYPE_STRING_OBJECT       = 1 << 8,
++    JS_NODE_TYPE_BOOLEAN_OBJECT      = 1 << 9,
++    JS_NODE_TYPE_SYMBOL_OBJECT       = 1 << 10,
++    JS_NODE_TYPE_BIGINT_OBJECT       = 1 << 11,
++    JS_NODE_TYPE_DATE                = 1 << 12,
++    JS_NODE_TYPE_REGEXP              = 1 << 13,
++    JS_NODE_TYPE_NATIVE_ERROR        = 1 << 14,
++    JS_NODE_TYPE_MAP                 = 1 << 15,
++    JS_NODE_TYPE_SET                 = 1 << 16,
++    JS_NODE_TYPE_WEAKMAP             = 1 << 17,
++    JS_NODE_TYPE_WEAKSET             = 1 << 18,
++    JS_NODE_TYPE_PROMISE             = 1 << 19,
++    JS_NODE_TYPE_PROXY               = 1 << 20,
++    JS_NODE_TYPE_ARRAY_BUFFER        = 1 << 21,
++    JS_NODE_TYPE_SHARED_ARRAY_BUFFER = 1 << 22,
++    JS_NODE_TYPE_DATA_VIEW           = 1 << 23,
++    JS_NODE_TYPE_TYPED_ARRAY         = 1 << 24,
++    JS_NODE_TYPE_WEAK_REF            = 1 << 25,
++    JS_NODE_TYPE_NATIVE_FUNCTION     = 1 << 26,
++};
++JS_EXTERN uint32_t JS_NodeTypeFlags(JSValueConst v);
++JS_EXTERN JSValue JS_NodePreviewEntries(JSContext *ctx, JSValueConst obj, bool *is_key_value);
++JS_EXTERN const void *JS_NodeStringData(JSContext *ctx, JSValue *pval, uint32_t *plen, int *pwide);
++JS_EXTERN JSValue JS_NodeNewStringLatin1(JSContext *ctx, const uint8_t *buf, size_t len);
++JS_EXTERN JSValue JS_NodeNewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len);
++JS_EXTERN JSValue JS_NodeNewStringRaw(JSContext *ctx, size_t len, int wide, void **pdata);
++JS_EXTERN int JS_NodeCurrentFrameCount(JSContext *ctx);
++JS_EXTERN int JS_NodeGetExceptionPosition(JSContext *ctx, JSValueConst exc,
++                                          JSValue *pfilename, int *pline, int *pcol);
++JS_EXTERN void JS_NodeClearBacktrace(JSContext *ctx);
++JS_EXTERN uint8_t *JS_NodeGetBufferBytes(JSContext *ctx, JSValueConst v, size_t *plen);
++JS_EXTERN JSValue JS_NodeGetViewBuffer(JSContext *ctx, JSValueConst v, size_t *poffset, size_t *plen);
++JS_EXTERN bool JS_NodeIsSharedArrayBuffer(JSValueConst v);
++JS_EXTERN bool JS_NodeIsArrayBufferView(JSValueConst v);
++JS_EXTERN JSValue JS_NodeCaptureCallSites(JSContext *ctx, int skip, int limit);
++JS_EXTERN int JS_NodeCheckModuleSyntax(JSContext *ctx, const char *input, size_t input_len,
++                                       const char *filename);
++JS_EXTERN void JS_NodeFreeModule(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN JSValue JS_NodeConcatStrings(JSContext *ctx, JSValue a, JSValue b);
++
+ /* Version */
+ 
++
+ #define QJS_VERSION_MAJOR 0
+ #define QJS_VERSION_MINOR 17
+ #define QJS_VERSION_PATCH 0
