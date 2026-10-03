@@ -1,0 +1,17 @@
+diff --git a/src/hotspot/share/runtime/frame.hpp b/src/hotspot/share/runtime/frame.hpp
+index fbe7310f3ae8..16d8ab36986d 100644
+--- a/src/hotspot/share/runtime/frame.hpp
++++ b/src/hotspot/share/runtime/frame.hpp
+@@ -182,7 +182,12 @@ class frame {
+   bool equal(frame other) const;
+ 
+   // type testers
++#ifdef ZERO
++  // Zero's interpreter frames have no pc: a frame is empty when it has no ZeroFrame either.
++  bool is_empty()                const { return _pc == nullptr && _sp == nullptr; }
++#else
+   bool is_empty()                const { return _pc == nullptr; }
++#endif
+   bool is_interpreted_frame()    const;
+   bool is_java_frame()           const;
+   bool is_entry_frame()          const;             // Java frame called from C?

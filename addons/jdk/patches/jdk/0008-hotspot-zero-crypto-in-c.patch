@@ -1,0 +1,976 @@
+diff --git a/src/hotspot/cpu/zero/globals_zero.hpp b/src/hotspot/cpu/zero/globals_zero.hpp
+index 76f9692e2021..8e853b21c1a7 100644
+--- a/src/hotspot/cpu/zero/globals_zero.hpp
++++ b/src/hotspot/cpu/zero/globals_zero.hpp
+@@ -86,6 +86,9 @@ define_pd_global(bool, CompactStrings, true);
+   product(bool, UseFastAccessorMethods, true,                               \
+           "Use fast method entry code for accessor methods")                \
+                                                                             \
++  product(bool, UseZeroCryptoIntrinsics, true,                              \
++          "Run crypto and big-number methods in C (zeroIntrinsics_zero.cpp)")\
++                                                                            \
+   product(bool, DecodeErrorContext, false, DIAGNOSTIC,                      \
+           "Try to decode the architecture-specific context for better "     \
+           "diagnostics")
+diff --git a/src/hotspot/cpu/zero/zeroInterpreter_zero.hpp b/src/hotspot/cpu/zero/zeroInterpreter_zero.hpp
+index 3761dfc58145..7d08f5901975 100644
+--- a/src/hotspot/cpu/zero/zeroInterpreter_zero.hpp
++++ b/src/hotspot/cpu/zero/zeroInterpreter_zero.hpp
+@@ -38,6 +38,7 @@
+   static int setter_entry(Method* method, intptr_t UNUSED, TRAPS);
+   static int empty_entry(Method* method, intptr_t UNUSED, TRAPS);
+   static int Reference_get_entry(Method* method, intptr_t UNUSED, TRAPS);
++  static int intrinsic_entry(Method* method, intptr_t UNUSED, TRAPS);  // zeroIntrinsics_zero.cpp
+ 
+   // Stack watermark machinery
+   static void stack_watermark_unwind_check(JavaThread* thread);
+diff --git a/src/hotspot/cpu/zero/zeroIntrinsics_zero.cpp b/src/hotspot/cpu/zero/zeroIntrinsics_zero.cpp
+new file mode 100644
+index 000000000000..186b7e0e43c8
+--- /dev/null
++++ b/src/hotspot/cpu/zero/zeroIntrinsics_zero.cpp
+@@ -0,0 +1,852 @@
++/*
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++// Crypto and big-number methods that the compilers replace with intrinsics, run in C by Zero: AES
++// blocks, AES in counter mode, GHASH, the compression functions of MD5, SHA-1, SHA-2 and SHA-512,
++// P-256 Montgomery multiplication, Math.multiplyHigh and BigInteger's multiply, square, mulAdd and
++// Montgomery steps. Interpreted, bulk AES and SHA-2 move about 100-200 KB/s and a P-256 signature
++// check takes a second, which makes TLS too slow to download anything. Each entry reads the
++// method's arguments off the Zero stack and the fields it needs off the objects, does what the
++// Java code does, and returns; anything unexpected (a null, an index out of range, a cipher other
++// than AES, an array that would have to be allocated) goes to the bytecodes instead, which also
++// throw the right exception.
++
++#include "classfile/classLoaderData.inline.hpp"
++#include "classfile/vmIntrinsics.hpp"
++#include "interpreter/zero/zeroInterpreter.hpp"
++#include "oops/fieldStreams.inline.hpp"
++#include "oops/instanceKlass.hpp"
++#include "oops/method.hpp"
++#include "oops/oop.inline.hpp"
++#include "oops/typeArrayOop.inline.hpp"
++#include "runtime/atomic.hpp"
++#include "runtime/javaThread.hpp"
++#include "runtime/safepointMechanism.inline.hpp"
++#include "utilities/globalDefinitions.hpp"
++
++#include "stack_zero.inline.hpp"
++
++namespace {
++
++// ── the Java objects ──────────────────────────────────────────────────────────────────────────
++
++// A field's offset in k or its superclasses, -1 if there is none.
++int field_offset(Klass* k, const char* name, const char* sig) {
++  for (; k != nullptr; k = k->super()) {
++    if (!k->is_instance_klass()) {
++      continue;
++    }
++    for (JavaFieldStream fs(InstanceKlass::cast(k)); !fs.done(); fs.next()) {
++      if (!fs.access_flags().is_static() && fs.name()->equals(name) && fs.signature()->equals(sig)) {
++        return fs.offset();
++      }
++    }
++  }
++  return -1;
++}
++
++// The class of the boot loader named name that k is or extends, null if none.
++Klass* boot_class(Klass* k, const char* name) {
++  for (; k != nullptr; k = k->super()) {
++    if (k->name()->equals(name) && k->class_loader_data()->is_boot_class_loader_data()) {
++      return k;
++    }
++  }
++  return nullptr;
++}
++
++// Offsets of a class's fields, looked up once. Several threads may look them up at the same time;
++// they find the same numbers, and klass is published last.
++template <int N>
++struct Fields {
++  Klass* volatile klass;
++  int off[N];
++
++  bool lookup(Klass* k, const char* const (&names)[N][2]) {
++    if (Atomic::load_acquire(&klass) == k) {
++      return true;
++    }
++    for (int i = 0; i < N; i++) {
++      off[i] = field_offset(k, names[i][0], names[i][1]);
++      if (off[i] < 0) {
++        return false;
++      }
++    }
++    Atomic::release_store(&klass, k);
++    return true;
++  }
++};
++
++// A byte[], int[] or long[] field, null if the field is null or shorter than min.
++template <typename T>
++T* array_field(oop o, int offset, BasicType type, int min) {
++  typeArrayOop a = (typeArrayOop) o->obj_field(offset);
++  if (a == nullptr || a->length() < min) {
++    return nullptr;
++  }
++  return (T*) a->base(type);
++}
++
++// Whether [ofs, ofs + len) lies in the array a (of any length when len is 0).
++bool in_bounds(typeArrayOop a, jint ofs, jlong len) {
++  return a != nullptr && ofs >= 0 && len >= 0 && (jlong) ofs + len <= a->length();
++}
++
++// A method's arguments on the Zero stack, by local index (the receiver, if any, is 0): the first
++// is deepest, and a long's two slots hold it at the lower address.
++class Args {
++  intptr_t* _sp;
++  int _size;
++
++ public:
++  Args(intptr_t* sp, int size) : _sp(sp), _size(size) {}
++  jint i(int n) const { return *(jint*) &_sp[_size - 1 - n]; }
++  jlong l(int n) const { return *(jlong*) &_sp[_size - 2 - n]; }
++  oop o(int n) const { return cast_to_oop(_sp[_size - 1 - n]); }
++  typeArrayOop a(int n) const { return (typeArrayOop) o(n); }
++};
++
++// What a method returns.
++struct Result {
++  BasicType type = T_VOID;
++  jint i = 0;
++  jlong l = 0;
++  oop o = nullptr;
++
++  bool set_int(jint v) { type = T_INT; i = v; return true; }
++  bool set_long(jlong v) { type = T_LONG; l = v; return true; }
++  bool set_object(oop v) { type = T_OBJECT; o = v; return true; }
++};
++
++inline juint load_be32(const jbyte* p) {
++  const uint8_t* b = (const uint8_t*) p;
++  return (juint) b[0] << 24 | (juint) b[1] << 16 | (juint) b[2] << 8 | b[3];
++}
++
++inline julong load_be64(const jbyte* p) {
++  return (julong) load_be32(p) << 32 | load_be32(p + 4);
++}
++
++inline juint load_le32(const jbyte* p) {
++  const uint8_t* b = (const uint8_t*) p;
++  return (juint) b[3] << 24 | (juint) b[2] << 16 | (juint) b[1] << 8 | b[0];
++}
++
++inline juint rotr32(juint x, int n) { return (x >> n) | (x << (32 - n)); }
++inline juint rotl32(juint x, int n) { return (x << n) | (x >> (32 - n)); }
++inline julong rotr64(julong x, int n) { return (x >> n) | (x << (64 - n)); }
++
++// The high 64 bits of the 128-bit product, as Math.unsignedMultiplyHigh and Math.multiplyHigh.
++inline julong umulh(julong a, julong b) {
++  julong a_lo = (juint) a, a_hi = a >> 32, b_lo = (juint) b, b_hi = b >> 32;
++  julong lo_lo = a_lo * b_lo, hi_lo = a_hi * b_lo, lo_hi = a_lo * b_hi, hi_hi = a_hi * b_hi;
++  julong cross = (lo_lo >> 32) + (juint) hi_lo + lo_hi;
++  return (hi_lo >> 32) + (cross >> 32) + hi_hi;
++}
++
++inline jlong smulh(jlong a, jlong b) {
++  return (jlong) (umulh((julong) a, (julong) b) - ((julong) (a >> 63) & (julong) b) -
++                  ((julong) (b >> 63) & (julong) a));
++}
++
++// ── AES (com.sun.crypto.provider.AESCrypt) ───────────────────────────────────────────────────
++// AESCrypt.java's rounds over the same tables: T1-T4 and S to encrypt, T5-T8 and Si to decrypt.
++// K is the session key the Java code made (K[0..3], K[4..limit-1] in rounds, K[limit..limit+3]
++// last to encrypt; K[4..7], K[8..limit+3], K[0..3] to decrypt).
++
++struct AesTables {
++  juint T1[256], T2[256], T3[256], T4[256], T5[256], T6[256], T7[256], T8[256];
++  uint8_t S[256], Si[256];
++};
++
++AesTables aes;
++volatile int aes_ready = 0;
++
++inline uint8_t gf_mul(uint8_t a, uint8_t b) {
++  uint8_t r = 0;
++  while (b != 0) {
++    if (b & 1) {
++      r ^= a;
++    }
++    a = (uint8_t) ((a << 1) ^ ((a & 0x80) ? 0x1b : 0));
++    b >>= 1;
++  }
++  return r;
++}
++
++void aes_init() {
++  if (Atomic::load_acquire(&aes_ready)) {
++    return;
++  }
++  // The S-box: the multiplicative inverse in GF(2^8), then the affine map.
++  for (int x = 0; x < 256; x++) {
++    uint8_t inv = 0;
++    for (int y = 1; y < 256 && x != 0; y++) {
++      if (gf_mul((uint8_t) x, (uint8_t) y) == 1) {
++        inv = (uint8_t) y;
++        break;
++      }
++    }
++    uint8_t s = inv ^ (uint8_t) (inv << 1 | inv >> 7) ^ (uint8_t) (inv << 2 | inv >> 6) ^
++                 (uint8_t) (inv << 3 | inv >> 5) ^ (uint8_t) (inv << 4 | inv >> 4) ^ 0x63;
++    aes.S[x] = s;
++    aes.Si[s] = (uint8_t) x;
++  }
++  for (int x = 0; x < 256; x++) {
++    uint8_t s = aes.S[x], si = aes.Si[x];
++    juint e = (juint) gf_mul(s, 2) << 24 | (juint) s << 16 | (juint) s << 8 | gf_mul(s, 3);
++    juint d = (juint) gf_mul(si, 14) << 24 | (juint) gf_mul(si, 9) << 16 |
++              (juint) gf_mul(si, 13) << 8 | gf_mul(si, 11);
++    aes.T1[x] = e; aes.T2[x] = rotr32(e, 8); aes.T3[x] = rotr32(e, 16); aes.T4[x] = rotr32(e, 24);
++    aes.T5[x] = d; aes.T6[x] = rotr32(d, 8); aes.T7[x] = rotr32(d, 16); aes.T8[x] = rotr32(d, 24);
++  }
++  Atomic::release_store(&aes_ready, 1);
++}
++
++inline void store_last(jbyte* out, uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, juint k) {
++  out[0] = (jbyte) (b0 ^ (k >> 24));
++  out[1] = (jbyte) (b1 ^ (k >> 16));
++  out[2] = (jbyte) (b2 ^ (k >> 8));
++  out[3] = (jbyte) (b3 ^ k);
++}
++
++void aes_encrypt(const jint* K, int limit, const jbyte* in, jbyte* out) {
++  const juint *T1 = aes.T1, *T2 = aes.T2, *T3 = aes.T3, *T4 = aes.T4;
++  const uint8_t* S = aes.S;
++  juint t0 = load_be32(in) ^ K[0], t1 = load_be32(in + 4) ^ K[1];
++  juint t2 = load_be32(in + 8) ^ K[2], t3 = load_be32(in + 12) ^ K[3];
++  for (int k = 4; k < limit; k += 4) {
++    juint a0 = T1[t0 >> 24] ^ T2[(t1 >> 16) & 0xff] ^ T3[(t2 >> 8) & 0xff] ^ T4[t3 & 0xff] ^ K[k];
++    juint a1 = T1[t1 >> 24] ^ T2[(t2 >> 16) & 0xff] ^ T3[(t3 >> 8) & 0xff] ^ T4[t0 & 0xff] ^ K[k + 1];
++    juint a2 = T1[t2 >> 24] ^ T2[(t3 >> 16) & 0xff] ^ T3[(t0 >> 8) & 0xff] ^ T4[t1 & 0xff] ^ K[k + 2];
++    juint a3 = T1[t3 >> 24] ^ T2[(t0 >> 16) & 0xff] ^ T3[(t1 >> 8) & 0xff] ^ T4[t2 & 0xff] ^ K[k + 3];
++    t0 = a0; t1 = a1; t2 = a2; t3 = a3;
++  }
++  store_last(out,      S[t0 >> 24], S[(t1 >> 16) & 0xff], S[(t2 >> 8) & 0xff], S[t3 & 0xff], K[limit]);
++  store_last(out + 4,  S[t1 >> 24], S[(t2 >> 16) & 0xff], S[(t3 >> 8) & 0xff], S[t0 & 0xff], K[limit + 1]);
++  store_last(out + 8,  S[t2 >> 24], S[(t3 >> 16) & 0xff], S[(t0 >> 8) & 0xff], S[t1 & 0xff], K[limit + 2]);
++  store_last(out + 12, S[t3 >> 24], S[(t0 >> 16) & 0xff], S[(t1 >> 8) & 0xff], S[t2 & 0xff], K[limit + 3]);
++}
++
++void aes_decrypt(const jint* K, int limit, const jbyte* in, jbyte* out) {
++  const juint *T5 = aes.T5, *T6 = aes.T6, *T7 = aes.T7, *T8 = aes.T8;
++  const uint8_t* Si = aes.Si;
++  juint t0 = load_be32(in) ^ K[4], t1 = load_be32(in + 4) ^ K[5];
++  juint t2 = load_be32(in + 8) ^ K[6], t3 = load_be32(in + 12) ^ K[7];
++  for (int k = 8; k < limit + 4; k += 4) {
++    juint a0 = T5[t0 >> 24] ^ T6[(t3 >> 16) & 0xff] ^ T7[(t2 >> 8) & 0xff] ^ T8[t1 & 0xff] ^ K[k];
++    juint a1 = T5[t1 >> 24] ^ T6[(t0 >> 16) & 0xff] ^ T7[(t3 >> 8) & 0xff] ^ T8[t2 & 0xff] ^ K[k + 1];
++    juint a2 = T5[t2 >> 24] ^ T6[(t1 >> 16) & 0xff] ^ T7[(t0 >> 8) & 0xff] ^ T8[t3 & 0xff] ^ K[k + 2];
++    juint a3 = T5[t3 >> 24] ^ T6[(t2 >> 16) & 0xff] ^ T7[(t1 >> 8) & 0xff] ^ T8[t0 & 0xff] ^ K[k + 3];
++    t0 = a0; t1 = a1; t2 = a2; t3 = a3;
++  }
++  store_last(out,      Si[t0 >> 24], Si[(t3 >> 16) & 0xff], Si[(t2 >> 8) & 0xff], Si[t1 & 0xff], K[0]);
++  store_last(out + 4,  Si[t1 >> 24], Si[(t0 >> 16) & 0xff], Si[(t3 >> 8) & 0xff], Si[t2 & 0xff], K[1]);
++  store_last(out + 8,  Si[t2 >> 24], Si[(t1 >> 16) & 0xff], Si[(t0 >> 8) & 0xff], Si[t3 & 0xff], K[2]);
++  store_last(out + 12, Si[t3 >> 24], Si[(t2 >> 16) & 0xff], Si[(t1 >> 8) & 0xff], Si[t0 & 0xff], K[3]);
++}
++
++Fields<2> aes_fields;
++const char* const aes_field_names[2][2] = { { "K", "[I" }, { "limit", "I" } };
++
++// An AESCrypt's session key and limit, or null if cipher is not one with a key.
++const jint* aes_key(oop cipher, int* limit) {
++  Klass* k = cipher->klass();
++  if (boot_class(k, "com/sun/crypto/provider/AESCrypt") != k || !aes_fields.lookup(k, aes_field_names)) {
++    return nullptr;
++  }
++  *limit = cipher->int_field(aes_fields.off[1]);
++  if (*limit != 40 && *limit != 48 && *limit != 56) {
++    return nullptr;
++  }
++  aes_init();
++  return array_field<jint>(cipher, aes_fields.off[0], T_INT, *limit + 4);
++}
++
++// AESCrypt.implEncryptBlock / implDecryptBlock(byte[] in, int inOffset, byte[] out, int outOffset)
++bool aes_block(const Args& args, bool decrypt) {
++  typeArrayOop in = args.a(1), out = args.a(3);
++  jint in_ofs = args.i(2), out_ofs = args.i(4);
++  int limit;
++  const jint* K = aes_key(args.o(0), &limit);
++  if (K == nullptr || !in_bounds(in, in_ofs, 16) || !in_bounds(out, out_ofs, 16)) {
++    return false;
++  }
++  const jbyte* src = (const jbyte*) in->base(T_BYTE) + in_ofs;
++  jbyte* dst = (jbyte*) out->base(T_BYTE) + out_ofs;
++  if (decrypt) {
++    aes_decrypt(K, limit, src, dst);
++  } else {
++    aes_encrypt(K, limit, src, dst);
++  }
++  return true;
++}
++
++Fields<5> ctr_fields;
++const char* const ctr_field_names[5][2] = {
++  { "embeddedCipher", "Lcom/sun/crypto/provider/SymmetricCipher;" }, { "blockSize", "I" },
++  { "counter", "[B" }, { "encryptedCounter", "[B" }, { "used", "I" }
++};
++
++// CounterMode.implCrypt(byte[] in, int inOff, int len, byte[] out, int outOff): XORs len bytes with
++// the key stream, encrypting the counter (and incrementing it) when a block of it is used up.
++bool ctr_crypt(Klass* holder, const Args& args, Result* result) {
++  oop mode = args.o(0);
++  typeArrayOop in = args.a(1), out = args.a(4);
++  jint in_ofs = args.i(2), len = args.i(3), out_ofs = args.i(5);
++  if (!ctr_fields.lookup(holder, ctr_field_names) || !in_bounds(in, in_ofs, len) ||
++      !in_bounds(out, out_ofs, len)) {
++    return false;
++  }
++  oop cipher = mode->obj_field(ctr_fields.off[0]);
++  typeArrayOop counter = (typeArrayOop) mode->obj_field(ctr_fields.off[2]);
++  jint used = mode->int_field(ctr_fields.off[4]);
++  int limit;
++  const jint* K = cipher != nullptr ? aes_key(cipher, &limit) : nullptr;
++  jbyte* stream = array_field<jbyte>(mode, ctr_fields.off[3], T_BYTE, 16);
++  if (K == nullptr || stream == nullptr || mode->int_field(ctr_fields.off[1]) != 16 ||
++      counter == nullptr || counter->length() < 16 || used < 0) {
++    return false;
++  }
++  jbyte* ctr = (jbyte*) counter->base(T_BYTE);
++  int ctr_len = counter->length();
++  const jbyte* src = (const jbyte*) in->base(T_BYTE) + in_ofs;
++  jbyte* dst = (jbyte*) out->base(T_BYTE) + out_ofs;
++  for (jint i = 0; i < len; i++) {
++    if (used >= 16) {
++      aes_encrypt(K, limit, ctr, stream);
++      for (int n = ctr_len - 1; n >= 0 && ++ctr[n] == 0; n--) {
++      }
++      used = 0;
++    }
++    dst[i] = (jbyte) (src[i] ^ stream[used++]);
++  }
++  mode->int_field_put(ctr_fields.off[4], used);
++  return result->set_int(len);
++}
++
++// ── GHASH (com.sun.crypto.provider.GHASH) ────────────────────────────────────────────────────
++
++// GHASH.processBlocks(byte[] data, int inOfs, int blocks, long[] st, long[] subH): GHASH.java's
++// blockMult, a bit at a time, for each block.
++bool ghash_blocks(const Args& args) {
++  typeArrayOop data = args.a(0), st = args.a(3), subH = args.a(4);
++  jint ofs = args.i(1), blocks = args.i(2);
++  if (!in_bounds(data, ofs, (jlong) blocks * 16) || st == nullptr || st->length() < 2 ||
++      subH == nullptr || subH->length() < 2) {
++    return false;
++  }
++  julong* s = (julong*) st->base(T_LONG);
++  const julong* h = (const julong*) subH->base(T_LONG);
++  const jbyte* p = (const jbyte*) data->base(T_BYTE) + ofs;
++  julong z0 = s[0], z1 = s[1];
++  for (jint b = 0; b < blocks; b++, p += 16) {
++    julong x0 = z0 ^ load_be64(p), x1 = z1 ^ load_be64(p + 8);
++    julong v0 = h[0], v1 = h[1];
++    z0 = z1 = 0;
++    for (int i = 0; i < 128; i++) {
++      julong x = i < 64 ? x0 << i : x1 << (i - 64);
++      julong mask = 0 - (x >> 63);
++      z0 ^= v0 & mask;
++      z1 ^= v1 & mask;
++      julong reduce = 0 - (v1 & 1);
++      v1 = (v1 >> 1) | (v0 << 63);
++      v0 = (v0 >> 1) ^ (0xe100000000000000ULL & reduce);
++    }
++  }
++  s[0] = z0;
++  s[1] = z1;
++  return true;
++}
++
++// ── digests (sun.security.provider) ──────────────────────────────────────────────────────────
++
++void md5_compress(juint* st, const jbyte* p) {
++  static const juint K[64] = {
++    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
++    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
++    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
++    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
++    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
++    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
++    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
++    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
++  };
++  static const int R[64] = {
++    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
++    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
++    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
++    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
++  };
++  juint m[16];
++  for (int i = 0; i < 16; i++) {
++    m[i] = load_le32(p + 4 * i);
++  }
++  juint a = st[0], b = st[1], c = st[2], d = st[3];
++  for (int i = 0; i < 64; i++) {
++    juint f;
++    int g;
++    if (i < 16)      { f = (b & c) | (~b & d); g = i; }
++    else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) & 15; }
++    else if (i < 48) { f = b ^ c ^ d;          g = (3 * i + 5) & 15; }
++    else             { f = c ^ (b | ~d);       g = (7 * i) & 15; }
++    juint t = d;
++    d = c;
++    c = b;
++    b = b + rotl32(a + f + K[i] + m[g], R[i]);
++    a = t;
++  }
++  st[0] += a; st[1] += b; st[2] += c; st[3] += d;
++}
++
++void sha1_compress(juint* st, const jbyte* p) {
++  juint w[80];
++  for (int i = 0; i < 16; i++) {
++    w[i] = load_be32(p + 4 * i);
++  }
++  for (int i = 16; i < 80; i++) {
++    w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++  }
++  juint a = st[0], b = st[1], c = st[2], d = st[3], e = st[4];
++  for (int i = 0; i < 80; i++) {
++    juint f, k;
++    if (i < 20)      { f = (b & c) | (~b & d);          k = 0x5a827999; }
++    else if (i < 40) { f = b ^ c ^ d;                   k = 0x6ed9eba1; }
++    else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
++    else             { f = b ^ c ^ d;                   k = 0xca62c1d6; }
++    juint t = rotl32(a, 5) + f + e + k + w[i];
++    e = d; d = c; c = rotl32(b, 30); b = a; a = t;
++  }
++  st[0] += a; st[1] += b; st[2] += c; st[3] += d; st[4] += e;
++}
++
++void sha256_compress(juint* st, const jbyte* p) {
++  static const juint K[64] = {
++    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
++  };
++  juint w[64];
++  for (int i = 0; i < 16; i++) {
++    w[i] = load_be32(p + 4 * i);
++  }
++  for (int i = 16; i < 64; i++) {
++    juint s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
++    juint s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
++    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++  }
++  juint a = st[0], b = st[1], c = st[2], d = st[3], e = st[4], f = st[5], g = st[6], h = st[7];
++  for (int i = 0; i < 64; i++) {
++    juint t1 = h + (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)) + (g ^ (e & (f ^ g))) + K[i] + w[i];
++    juint t2 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)) + ((a & b) ^ ((a ^ b) & c));
++    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++  }
++  st[0] += a; st[1] += b; st[2] += c; st[3] += d; st[4] += e; st[5] += f; st[6] += g; st[7] += h;
++}
++
++void sha512_compress(julong* st, const jbyte* p) {
++  static const julong K[80] = {
++    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
++    0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
++    0xd807aa98a3030242ULL, 0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
++    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
++    0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL, 0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
++    0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
++    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
++    0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL, 0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
++    0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
++    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
++    0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL, 0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
++    0xd192e819d6ef5218ULL, 0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
++    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
++    0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL, 0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
++    0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
++    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
++    0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
++    0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
++    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
++    0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
++  };
++  julong w[80];
++  for (int i = 0; i < 16; i++) {
++    w[i] = load_be64(p + 8 * i);
++  }
++  for (int i = 16; i < 80; i++) {
++    julong s0 = rotr64(w[i - 15], 1) ^ rotr64(w[i - 15], 8) ^ (w[i - 15] >> 7);
++    julong s1 = rotr64(w[i - 2], 19) ^ rotr64(w[i - 2], 61) ^ (w[i - 2] >> 6);
++    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++  }
++  julong a = st[0], b = st[1], c = st[2], d = st[3], e = st[4], f = st[5], g = st[6], h = st[7];
++  for (int i = 0; i < 80; i++) {
++    julong t1 = h + (rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)) + (g ^ (e & (f ^ g))) + K[i] + w[i];
++    julong t2 = (rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)) + ((a & b) ^ ((a ^ b) & c));
++    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++  }
++  st[0] += a; st[1] += b; st[2] += c; st[3] += d; st[4] += e; st[5] += f; st[6] += g; st[7] += h;
++}
++
++
++// A digest class the C here does: the class whose int[] or long[] state it compresses into.
++struct Digest {
++  const char* klass;
++  const char* state_sig;
++  int state_len;
++  int block_size;
++  Fields<1>* fields;
++  void (*compress)(void* state, const jbyte* block);
++};
++
++Fields<1> md5_fields, sha1_fields, sha2_fields, sha5_fields;
++
++const Digest digests[] = {
++  { "sun/security/provider/MD5",  "[I", 4, 64,  &md5_fields,  (void (*)(void*, const jbyte*)) md5_compress },
++  { "sun/security/provider/SHA",  "[I", 5, 64,  &sha1_fields, (void (*)(void*, const jbyte*)) sha1_compress },
++  { "sun/security/provider/SHA2", "[I", 8, 64,  &sha2_fields, (void (*)(void*, const jbyte*)) sha256_compress },
++  { "sun/security/provider/SHA5", "[J", 8, 128, &sha5_fields, (void (*)(void*, const jbyte*)) sha512_compress },
++};
++
++// The digest's state array if o is one of the digests, null if not.
++void* digest_state(oop o, const Digest** which) {
++  for (const Digest& d : digests) {
++    Klass* k = boot_class(o->klass(), d.klass);
++    if (k == nullptr) {
++      continue;
++    }
++    const char* const names[1][2] = { { "state", d.state_sig } };
++    if (!d.fields->lookup(k, names)) {
++      return nullptr;
++    }
++    *which = &d;
++    return d.state_sig[1] == 'I'
++        ? (void*) array_field<jint>(o, d.fields->off[0], T_INT, d.state_len)
++        : (void*) array_field<jlong>(o, d.fields->off[0], T_LONG, d.state_len);
++  }
++  return nullptr;
++}
++
++// MD5/SHA/SHA2/SHA5.implCompress0(byte[] buf, int ofs)
++bool digest_block(const Args& args) {
++  typeArrayOop buf = args.a(1);
++  jint ofs = args.i(2);
++  const Digest* d;
++  void* state = digest_state(args.o(0), &d);
++  if (state == nullptr || !in_bounds(buf, ofs, d->block_size)) {
++    return false;
++  }
++  d->compress(state, (const jbyte*) buf->base(T_BYTE) + ofs);
++  return true;
++}
++
++// DigestBase.implCompressMultiBlock0(byte[] b, int ofs, int limit): every block from ofs that
++// starts at or before limit, returning the offset after the last.
++bool digest_blocks(const Args& args, Result* result) {
++  typeArrayOop buf = args.a(1);
++  jint ofs = args.i(2), limit = args.i(3);
++  const Digest* d;
++  void* state = digest_state(args.o(0), &d);
++  if (state == nullptr) {
++    return false;
++  }
++  if (ofs > limit) {
++    return result->set_int(ofs);
++  }
++  if (!in_bounds(buf, ofs, (jlong) limit - ofs + d->block_size)) {
++    return false;
++  }
++  const jbyte* p = (const jbyte*) buf->base(T_BYTE);
++  for (; ofs <= limit; ofs += d->block_size) {
++    d->compress(state, p + ofs);
++  }
++  return result->set_int(ofs);
++}
++
++// ── P-256 (sun.security.util.math.intpoly) ───────────────────────────────────────────────────
++
++// MontgomeryIntegerPolynomialP256.mult(long[] a, long[] b, long[] r): the Java code's Montgomery
++// multiplication modulo p in five 52-bit limbs, its five unrolled rows as a loop.
++bool p256_mult(const Args& args) {
++  typeArrayOop at = args.a(1), bt = args.a(2), rt = args.a(3);
++  if (at == nullptr || at->length() < 5 || bt == nullptr || bt->length() < 5 || rt == nullptr || rt->length() < 5) {
++    return false;
++  }
++  static const julong M[5] = { 0x000fffffffffffffULL, 0x00000fffffffffffULL, 0, 0x0000001000000000ULL,
++                               0x0000ffffffff0000ULL };
++  const julong MASK = (1ULL << 52) - 1;
++  const julong* a = (const julong*) at->base(T_LONG);
++  const julong* b = (const julong*) bt->base(T_LONG);
++  julong c[10] = { 0 };
++  for (int i = 0; i < 5; i++) {
++    julong d[5], dd[5];
++    for (int j = 0; j < 5; j++) {
++      julong lo = a[i] * b[j];
++      dd[j] = umulh(a[i], b[j]) << 12 | (lo >> 52);
++      d[j] = lo & MASK;
++    }
++    d[0] += c[i];
++    julong n = d[0] & MASK;
++    for (int j = 0; j < 5; j++) {
++      julong lo = n * M[j];
++      dd[j] += umulh(n, M[j]) << 12 | (lo >> 52);
++      d[j] += lo & MASK;
++    }
++    if (i < 4) {
++      c[i + 1] += d[1] + dd[0] + (d[0] >> 52);
++      c[i + 2] += d[2] + dd[1];
++      c[i + 3] += d[3] + dd[2];
++      c[i + 4] += d[4] + dd[3];
++      c[i + 5] = dd[4];
++    } else {
++      c[5] += d[1] + dd[0] + (d[0] >> 52);
++      c[6] += d[2] + dd[1] + (c[5] >> 52);
++      c[7] += d[3] + dd[2] + (c[6] >> 52);
++      c[8] += d[4] + dd[3] + (c[7] >> 52);
++      c[9] = dd[4] + (c[8] >> 52);
++    }
++  }
++  for (int k = 5; k < 9; k++) {
++    c[k] &= MASK;
++  }
++  // Subtract p once, with signed carries; keep {c5..c9} if that went below zero
++  c[0] = c[5] - M[0];
++  for (int k = 1; k < 5; k++) {
++    c[k] = c[k + 5] - M[k] + (julong) ((jlong) c[k - 1] >> 52);
++    c[k - 1] &= MASK;
++  }
++  julong mask = (julong) ((jlong) c[4] >> 63);
++  julong* r = (julong*) rt->base(T_LONG);
++  for (int k = 0; k < 5; k++) {
++    r[k] = (c[k + 5] & mask) | (c[k] & ~mask);
++  }
++  return true;
++}
++
++// IntegerPolynomial.conditionalAssign(int set, long[] a, long[] b): a = b if set is 1.
++bool intpoly_assign(const Args& args) {
++  typeArrayOop at = args.a(1), bt = args.a(2);
++  if (at == nullptr || bt == nullptr || bt->length() < at->length()) {
++    return false;
++  }
++  julong mask = (julong) (jlong) (jint) (0u - (juint) args.i(0));
++  julong* a = (julong*) at->base(T_LONG);
++  const julong* b = (const julong*) bt->base(T_LONG);
++  for (int i = 0; i < at->length(); i++) {
++    a[i] ^= mask & (a[i] ^ b[i]);
++  }
++  return true;
++}
++
++// ── BigInteger (java.math) ───────────────────────────────────────────────────────────────────
++// Magnitudes are big-endian int[]s: element 0 is the most significant word.
++
++// implMultiplyToLen: z[0 .. xlen+ylen) = x[0 .. xlen) * y[0 .. ylen).
++void multiply_to_len(const juint* x, int xlen, const juint* y, int ylen, juint* z) {
++  julong carry = 0;
++  for (int j = ylen - 1, k = ylen + xlen - 1; j >= 0; j--, k--) {
++    julong product = (julong) y[j] * x[xlen - 1] + carry;
++    z[k] = (juint) product;
++    carry = product >> 32;
++  }
++  z[xlen - 1] = (juint) carry;
++  for (int i = xlen - 2; i >= 0; i--) {
++    carry = 0;
++    for (int j = ylen - 1, k = ylen + i; j >= 0; j--, k--) {
++      julong product = (julong) y[j] * x[i] + z[k] + carry;
++      z[k] = (juint) product;
++      carry = product >> 32;
++    }
++    z[i] = (juint) carry;
++  }
++}
++
++// implMulAdd: out[out_len-offset-len .. out_len-offset) += in[0 .. len) * k; returns the carry.
++juint mul_add(juint* out, int out_len, const juint* in, int offset, int len, juint k) {
++  julong carry = 0;
++  offset = out_len - offset - 1;
++  for (int j = len - 1; j >= 0; j--) {
++    julong product = (julong) in[j] * k + out[offset] + carry;
++    out[offset--] = (juint) product;
++    carry = product >> 32;
++  }
++  return (juint) carry;
++}
++
++// montReduce(n, mod, mlen, inv) with addOne, subN and intArrayCmpToLen, as BigInteger.java has them.
++void mont_reduce(juint* n, int n_len, const juint* mod, int mlen, juint inv) {
++  jint c = 0;
++  int len = mlen, offset = 0;
++  do {
++    juint carry = mul_add(n, n_len, mod, offset, mlen, inv * n[n_len - 1 - offset]);
++    // addOne(n, offset, mlen, carry)
++    int o = n_len - 1 - mlen - offset;
++    julong t = (julong) n[o] + carry;
++    n[o] = (juint) t;
++    if ((t >> 32) != 0) {
++      int m = mlen, add = 1;
++      while (--m >= 0) {
++        if (--o < 0) {
++          break;
++        }
++        if (++n[o] != 0) {
++          add = 0;
++          break;
++        }
++      }
++      c += add;
++    }
++    offset++;
++  } while (--len > 0);
++  for (;;) {
++    // while (c > 0) c += subN(n, mod, mlen); then while (n >= mod) subN(n, mod, mlen)
++    bool ge = true;
++    if (c <= 0) {
++      for (int i = 0; i < mlen; i++) {
++        if (n[i] != mod[i]) {
++          ge = n[i] > mod[i];
++          break;
++        }
++      }
++      if (!ge) {
++        break;
++      }
++    }
++    jlong sum = 0;
++    for (int i = mlen - 1; i >= 0; i--) {
++      sum = (jlong) n[i] - (jlong) mod[i] + (sum >> 32);
++      n[i] = (juint) sum;
++    }
++    if (c > 0) {
++      c += (jint) (sum >> 32);
++    }
++  }
++}
++
++// BigInteger.implMultiplyToLen(int[] x, int xlen, int[] y, int ylen, int[] z) returns z
++bool bigint_multiply(const Args& args, Result* result) {
++  typeArrayOop x = args.a(0), y = args.a(2), z = args.a(4);
++  jint xlen = args.i(1), ylen = args.i(3);
++  if (x == nullptr || y == nullptr || z == nullptr || xlen < 1 || ylen < 1 || xlen > x->length() ||
++      ylen > y->length() || (jlong) xlen + ylen > z->length() || x == z || y == z) {
++    return false;
++  }
++  multiply_to_len((const juint*) x->base(T_INT), xlen, (const juint*) y->base(T_INT), ylen, (juint*) z->base(T_INT));
++  return result->set_object(z);
++}
++
++// BigInteger.implSquareToLen(int[] x, int len, int[] z, int zlen) returns z
++bool bigint_square(const Args& args, Result* result) {
++  typeArrayOop x = args.a(0), z = args.a(2);
++  jint len = args.i(1), zlen = args.i(3);
++  if (x == nullptr || z == nullptr || len < 1 || len > x->length() || zlen != 2 * len ||
++      zlen > z->length() || x == z) {
++    return false;
++  }
++  const juint* xs = (const juint*) x->base(T_INT);
++  multiply_to_len(xs, len, xs, len, (juint*) z->base(T_INT));
++  return result->set_object(z);
++}
++
++// BigInteger.implMulAdd(int[] out, int[] in, int offset, int len, int k)
++bool bigint_mul_add(const Args& args, Result* result) {
++  typeArrayOop out = args.a(0), in = args.a(1);
++  jint offset = args.i(2), len = args.i(3);
++  if (out == nullptr || in == nullptr || len < 0 || len > in->length() || offset < 0 ||
++      (jlong) offset + len > out->length() || out == in) {
++    return false;
++  }
++  return result->set_int((jint) mul_add((juint*) out->base(T_INT), out->length(), (const juint*) in->base(T_INT),
++                                        offset, len, (juint) args.i(4)));
++}
++
++// BigInteger.implMontgomeryMultiply(int[] a, int[] b, int[] n, int len, long inv, int[] product)
++// and implMontgomerySquare(int[] a, int[] n, int len, long inv, int[] product): product = a * b,
++// reduced; when product is too short for that, Java allocates one.
++bool bigint_montgomery(const Args& args, bool square, Result* result) {
++  int at = square ? 1 : 0;  // the arguments after b
++  typeArrayOop a = args.a(0), b = square ? a : args.a(1), n = args.a(2 - at);
++  jint len = args.i(3 - at);
++  jlong inv = args.l(4 - at);
++  typeArrayOop product = args.a(6 - at);
++  if (a == nullptr || b == nullptr || n == nullptr || product == nullptr || len < 1 ||
++      len > a->length() || len > b->length() || len > n->length() || 2 * len > product->length() ||
++      product == a || product == b || product == n) {
++    return false;
++  }
++  juint* p = (juint*) product->base(T_INT);
++  multiply_to_len((const juint*) a->base(T_INT), len, (const juint*) b->base(T_INT), len, p);
++  mont_reduce(p, product->length(), (const juint*) n->base(T_INT), len, (juint) inv);
++  return result->set_object(product);
++}
++
++} // namespace
++
++int ZeroInterpreter::intrinsic_entry(Method* method, intptr_t UNUSED, TRAPS) {
++  JavaThread* thread = THREAD;
++  // Safepoints, and a debugger that wants to see every bytecode, go the slow way
++  if (SafepointMechanism::should_process(thread) || thread->is_interp_only_mode()) {
++    return normal_entry(method, 0, THREAD);
++  }
++
++  ZeroStack* stack = thread->zero_stack();
++  intptr_t* sp = stack->sp();
++  int size = method->size_of_parameters();
++  Args args(sp, size);
++  Result result;
++  bool done = false;
++  switch (method->intrinsic_id()) {
++    case vmIntrinsics::_aescrypt_encryptBlock:       done = aes_block(args, false); break;
++    case vmIntrinsics::_aescrypt_decryptBlock:       done = aes_block(args, true); break;
++    case vmIntrinsics::_counterMode_AESCrypt:        done = ctr_crypt(method->method_holder(), args, &result); break;
++    case vmIntrinsics::_ghash_processBlocks:         done = ghash_blocks(args); break;
++    case vmIntrinsics::_md5_implCompress:            // fall thru
++    case vmIntrinsics::_sha_implCompress:            // fall thru
++    case vmIntrinsics::_sha2_implCompress:           // fall thru
++    case vmIntrinsics::_sha5_implCompress:           done = digest_block(args); break;
++    case vmIntrinsics::_digestBase_implCompressMB:   done = digest_blocks(args, &result); break;
++    case vmIntrinsics::_intpoly_montgomeryMult_P256: done = p256_mult(args); break;
++    case vmIntrinsics::_intpoly_assign:              done = intpoly_assign(args); break;
++    case vmIntrinsics::_multiplyHigh:                done = result.set_long(smulh(args.l(0), args.l(2))); break;
++    case vmIntrinsics::_unsignedMultiplyHigh:        done = result.set_long((jlong) umulh(args.l(0), args.l(2))); break;
++    case vmIntrinsics::_multiplyToLen:               done = bigint_multiply(args, &result); break;
++    case vmIntrinsics::_squareToLen:                 done = bigint_square(args, &result); break;
++    case vmIntrinsics::_mulAdd:                      done = bigint_mul_add(args, &result); break;
++    case vmIntrinsics::_montgomeryMultiply:          done = bigint_montgomery(args, false, &result); break;
++    case vmIntrinsics::_montgomerySquare:            done = bigint_montgomery(args, true, &result); break;
++    default:                                         break;
++  }
++  if (!done) {
++    return normal_entry(method, 0, THREAD);
++  }
++
++  // Pop the arguments, push the result
++  intptr_t* top = sp + size - type2size[result.type];
++  stack->set_sp(top);
++  switch (result.type) {
++    case T_INT:    *(jint*) top = result.i; break;
++    case T_LONG:   *(jlong*) top = result.l; break;
++    case T_OBJECT: *(oop*) top = result.o; break;
++    default:       break;
++  }
++
++  // No deoptimized frames on the stack
++  return 0;
++}
+diff --git a/src/hotspot/share/interpreter/abstractInterpreter.cpp b/src/hotspot/share/interpreter/abstractInterpreter.cpp
+index ad39169bca0b..12971c04353f 100644
+--- a/src/hotspot/share/interpreter/abstractInterpreter.cpp
++++ b/src/hotspot/share/interpreter/abstractInterpreter.cpp
+@@ -149,6 +149,27 @@ AbstractInterpreter::MethodKind AbstractInterpreter::method_kind(const methodHan
+       case vmIntrinsics::_dsqrt:             return java_lang_math_sqrt;
+       case vmIntrinsics::_dsqrt_strict:      return java_lang_math_sqrt_strict;
+       case vmIntrinsics::_Reference_get0:    return java_lang_ref_reference_get0;
++#ifdef ZERO
++      case vmIntrinsics::_aescrypt_encryptBlock:
++      case vmIntrinsics::_aescrypt_decryptBlock:
++      case vmIntrinsics::_counterMode_AESCrypt:
++      case vmIntrinsics::_ghash_processBlocks:
++      case vmIntrinsics::_md5_implCompress:
++      case vmIntrinsics::_sha_implCompress:
++      case vmIntrinsics::_sha2_implCompress:
++      case vmIntrinsics::_sha5_implCompress:
++      case vmIntrinsics::_digestBase_implCompressMB:
++      case vmIntrinsics::_intpoly_montgomeryMult_P256:
++      case vmIntrinsics::_intpoly_assign:
++      case vmIntrinsics::_multiplyHigh:
++      case vmIntrinsics::_unsignedMultiplyHigh:
++      case vmIntrinsics::_multiplyToLen:
++      case vmIntrinsics::_squareToLen:
++      case vmIntrinsics::_mulAdd:
++      case vmIntrinsics::_montgomeryMultiply:
++      case vmIntrinsics::_montgomerySquare:
++                                             return zero_crypto_intrinsic;
++#endif // ZERO
+       case vmIntrinsics::_Object_init:
+         if (m->code_size() == 1) {
+           // We need to execute the special return bytecode to check for
+diff --git a/src/hotspot/share/interpreter/abstractInterpreter.hpp b/src/hotspot/share/interpreter/abstractInterpreter.hpp
+index a3e93aa0a301..3886654b5188 100644
+--- a/src/hotspot/share/interpreter/abstractInterpreter.hpp
++++ b/src/hotspot/share/interpreter/abstractInterpreter.hpp
+@@ -92,6 +92,9 @@ class AbstractInterpreter: AllStatic {
+     java_lang_Float_float16ToFloat,                             // implementation of java.lang.Float.float16ToFloat()
+     java_lang_Float_floatToFloat16,                             // implementation of java.lang.Float.floatToFloat16()
+     java_lang_Thread_currentThread,                             // implementation of java.lang.Thread.currentThread()
++#ifdef ZERO
++    zero_crypto_intrinsic,                                      // crypto and big-number methods Zero runs in C
++#endif
+     number_of_method_entries,
+     invalid = -1
+   };
+diff --git a/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.cpp b/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.cpp
+index 8fa0835216d0..718af3abbc37 100644
+--- a/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.cpp
++++ b/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.cpp
+@@ -65,6 +65,7 @@ void ZeroInterpreterGenerator::generate_all() {
+     method_entry(java_lang_math_fmaD );
+     method_entry(java_lang_math_fmaF );
+     method_entry(java_lang_ref_reference_get0);
++    method_entry(zero_crypto_intrinsic);
+ 
+     AbstractInterpreter::initialize_method_handle_entries();
+ 
+@@ -109,6 +110,7 @@ address ZeroInterpreterGenerator::generate_method_entry(
+   case Interpreter::java_lang_math_fmaF    : entry_point = generate_math_entry(kind);      break;
+   case Interpreter::java_lang_ref_reference_get0
+                                            : entry_point = generate_Reference_get_entry(); break;
++  case Interpreter::zero_crypto_intrinsic  : entry_point = generate_crypto_intrinsic_entry(); break;
+   default:
+     fatal("unexpected method kind: %d", kind);
+     break;
+@@ -177,6 +179,13 @@ address ZeroInterpreterGenerator::generate_Reference_get_entry(void) {
+   return generate_entry((address) ZeroInterpreter::Reference_get_entry);
+ }
+ 
++address ZeroInterpreterGenerator::generate_crypto_intrinsic_entry() {
++  if (!UseZeroCryptoIntrinsics)
++    return nullptr;
++
++  return generate_entry((address) ZeroInterpreter::intrinsic_entry);
++}
++
+ address ZeroInterpreterGenerator::generate_native_entry(bool synchronized) {
+   return generate_entry((address) ZeroInterpreter::native_entry);
+ }
+diff --git a/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.hpp b/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.hpp
+index 8c745e519498..cfb166be527d 100644
+--- a/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.hpp
++++ b/src/hotspot/share/interpreter/zero/zeroInterpreterGenerator.hpp
+@@ -47,6 +47,7 @@ class ZeroInterpreterGenerator: public AbstractInterpreterGenerator {
+   address generate_getter_entry();
+   address generate_setter_entry();
+   address generate_Reference_get_entry();
++  address generate_crypto_intrinsic_entry();
+ 
+  public:
+   ZeroInterpreterGenerator();

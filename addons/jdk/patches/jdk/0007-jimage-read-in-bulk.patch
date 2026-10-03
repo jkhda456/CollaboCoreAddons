@@ -1,0 +1,231 @@
+diff --git a/src/java.base/share/classes/jdk/internal/jimage/ImageLocation.java b/src/java.base/share/classes/jdk/internal/jimage/ImageLocation.java
+index f31c7291927e..6cdad6879411 100644
+--- a/src/java.base/share/classes/jdk/internal/jimage/ImageLocation.java
++++ b/src/java.base/share/classes/jdk/internal/jimage/ImageLocation.java
+@@ -63,9 +63,21 @@ public class ImageLocation {
+         Objects.requireNonNull(bytes);
+         long[] attributes = new long[ATTRIBUTE_COUNT];
+ 
++        // The attributes are at most ATTRIBUTE_COUNT kinds of up to 9 bytes each: copy them out
++        // with one bulk get, then decode the copy. (ByteBuffer.get(int) a byte at a time is a
++        // dozen calls a byte in an interpreter, HotSpot's Zero, as in the WebAssembly port for
++        // collaboCore; only JDK 8 API here: this code is also built into jrt-fs.jar.)
+         int limit = bytes.limit();
+-        while (offset < limit) {
+-            int data = bytes.get(offset++) & 0xFF;
++        if (offset >= limit) {
++            return attributes;
++        }
++        byte[] copy = new byte[Math.min(ATTRIBUTE_COUNT * 9 + 1, limit - offset)];
++        ByteBuffer source = bytes.duplicate();
++        source.position(offset);
++        source.get(copy);
++        int i = 0;
++        while (i < copy.length) {
++            int data = copy[i++] & 0xFF;
+             if (data <= 0x7) { // ATTRIBUTE_END
+                 break;
+             }
+@@ -76,8 +88,14 @@ public class ImageLocation {
+             }
+ 
+             int length = (data & 0x7) + 1;
+-            attributes[kind] = readValue(length, bytes, offset, limit);
+-            offset += length;
++            long value = 0;
++            for (int j = 0; j < length; j++) {
++                if (i >= copy.length) {
++                    throw new InternalError("Missing jimage attribute data");
++                }
++                value = (value << 8) | (copy[i++] & 0xFF);
++            }
++            attributes[kind] = value;
+         }
+         return attributes;
+     }
+diff --git a/src/java.base/share/classes/jdk/internal/jimage/ImageStringsReader.java b/src/java.base/share/classes/jdk/internal/jimage/ImageStringsReader.java
+index c4601ef3e6cc..b8bb9d89f9e8 100644
+--- a/src/java.base/share/classes/jdk/internal/jimage/ImageStringsReader.java
++++ b/src/java.base/share/classes/jdk/internal/jimage/ImageStringsReader.java
+@@ -28,6 +28,7 @@ package jdk.internal.jimage;
+ import java.io.UTFDataFormatException;
+ import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
++import java.util.Arrays;
+ import java.util.Objects;
+ 
+ /**
+@@ -188,107 +189,61 @@ public class ImageStringsReader implements ImageStrings {
+         return stringFromMUTF8(bytes, 0, bytes.length);
+     }
+ 
+-    /**
+-     * Calculates the number of characters in the String present at the
+-     * specified offset. As an optimization, the length returned will
+-     * be positive if the characters are all ASCII, and negative otherwise.
+-     */
+-    private static int charsFromByteBufferLength(ByteBuffer buffer, int offset) {
+-        int length = 0;
+-
+-        int limit = buffer.limit();
+-        boolean asciiOnly = true;
+-        while (offset < limit) {
+-            byte ch = buffer.get(offset++);
+-
+-            if (ch < 0) {
+-                asciiOnly = false;
+-            } else if (ch == 0) {
+-                return asciiOnly ? length : -length;
+-            }
+-
+-            if ((ch & 0xC0) != 0x80) {
+-                length++;
+-            }
+-        }
+-        throw new InternalError("No terminating zero byte for modified UTF-8 byte sequence");
++    public static String stringFromByteBuffer(ByteBuffer buffer) {
++        return stringFromByteBuffer(buffer, 0);
+     }
+ 
+-    private static void charsFromByteBuffer(char[] chars, ByteBuffer buffer, int offset) {
+-        int j = 0;
+-
++    /*
++     * The NUL-terminated modified UTF-8 bytes at offset, without the NUL, copied out of the buffer
++     * with bulk gets. In an interpreter (HotSpot's Zero, as in the WebAssembly port for
++     * collaboCore) ByteBuffer.get(int) costs a dozen calls a byte, and decoding the image's strings
++     * a byte at a time was most of what javac did (listing the jrt:/ packages); a bulk get is one
++     * native copy. (Only JDK 8 API: this code is also built into jrt-fs.jar.)
++     */
++    private static byte[] bytesFromByteBuffer(ByteBuffer buffer, int offset) {
+         int limit = buffer.limit();
+-        while (offset < limit) {
+-            byte ch = buffer.get(offset++);
+-
+-            if (ch == 0) {
+-                return;
+-            }
+-
+-            boolean is_unicode = (ch & 0x80) != 0;
+-            int uch = ch & 0x7F;
+-
+-            if (is_unicode) {
+-                int mask = 0x40;
+-
+-                while ((uch & mask) != 0) {
+-                    ch = buffer.get(offset++);
+-
+-                    if ((ch & 0xC0) != 0x80) {
+-                        throw new InternalError("Bad continuation in " +
+-                            "modified UTF-8 byte sequence: " + ch);
+-                    }
+-
+-                    uch = ((uch & ~mask) << 6) | (ch & 0x3F);
+-                    mask <<= 6 - 1;
++        if (offset >= limit) {
++            throw new InternalError("No terminating zero byte for modified UTF-8 byte sequence");
++        }
++        ByteBuffer source = buffer.duplicate();
++        byte[] bytes = new byte[Math.min(64, limit - offset)];
++        int n = 0;
++        for (;;) {
++            source.position(offset + n);
++            source.get(bytes, n, bytes.length - n);
++            for (int i = n; i < bytes.length; i++) {
++                if (bytes[i] == 0) {
++                    return Arrays.copyOf(bytes, i);
+                 }
+             }
+-
+-            if ((uch & 0xFFFF) != uch) {
+-                throw new InternalError("UTF-32 char in modified UTF-8 " +
+-                    "byte sequence: " + uch);
++            n = bytes.length;
++            if (offset + n >= limit) {
++                throw new InternalError("No terminating zero byte for modified UTF-8 byte sequence");
+             }
+-
+-            chars[j++] = (char)uch;
++            bytes = Arrays.copyOf(bytes, Math.min(2 * n, limit - offset));
+         }
+-
+-        throw new InternalError("No terminating zero byte for modified UTF-8 byte sequence");
+-    }
+-
+-    public static String stringFromByteBuffer(ByteBuffer buffer) {
+-        return stringFromByteBuffer(buffer, 0);
+     }
+ 
+     /* package-private */
+     static String stringFromByteBuffer(ByteBuffer buffer, int offset) {
+-        int length = charsFromByteBufferLength(buffer, offset);
+-        if (length > 0) {
+-            byte[] asciiBytes = new byte[length];
+-            // Ideally we could use buffer.get(offset, asciiBytes, 0, length)
+-            // here, but that was introduced in JDK 13
+-            for (int i = 0; i < length; i++) {
+-                asciiBytes[i] = buffer.get(offset++);
++        byte[] bytes = bytesFromByteBuffer(buffer, offset);
++        for (byte b : bytes) {
++            if (b < 0) {
++                return stringFromMUTF8(bytes, 0, bytes.length);
+             }
+-            return new String(asciiBytes, StandardCharsets.US_ASCII);
+         }
+-        char[] chars = new char[-length];
+-        charsFromByteBuffer(chars, buffer, offset);
+-        return new String(chars);
++        return new String(bytes, StandardCharsets.US_ASCII);
+     }
+ 
+     /* package-private */
+     static int stringFromByteBufferMatches(ByteBuffer buffer, int offset, String string, int stringOffset) {
++        byte[] bytes = bytesFromByteBuffer(buffer, offset);
+         // ASCII fast-path
+-        int limit = buffer.limit();
+-        int current = offset;
+         int slen = string.length();
+-        while (current < limit) {
+-            byte ch = buffer.get(current);
+-            if (ch <= 0) {
+-                if (ch == 0) {
+-                    // Match
+-                    return current - offset;
+-                }
++        int current = 0;
++        while (current < bytes.length) {
++            byte ch = bytes[current];
++            if (ch < 0) {
+                 // non-ASCII byte, run slow-path from current offset
+                 break;
+             }
+@@ -299,17 +254,24 @@ public class ImageStringsReader implements ImageStrings {
+             stringOffset++;
+             current++;
+         }
+-        // invariant: remainder of the string starting at current is non-ASCII,
+-        // so return value from charsFromByteBufferLength will be negative
+-        int length = -charsFromByteBufferLength(buffer, current);
++        if (current == bytes.length) {
++            // Match
++            return current;
++        }
++        // invariant: remainder of the string starting at current is non-ASCII
++        int length = charsFromMUTF8Length(bytes, current, bytes.length - current);
+         char[] chars = new char[length];
+-        charsFromByteBuffer(chars, buffer, current);
++        try {
++            charsFromMUTF8(chars, bytes, current, bytes.length - current);
++        } catch (UTFDataFormatException ex) {
++            throw new InternalError("Attempt to convert non modified UTF-8 byte sequence", ex);
++        }
+         for (int i = 0; i < length; i++) {
+             if (string.charAt(stringOffset++) != chars[i]) {
+                 return -1;
+             }
+         }
+-        return current - offset + length;
++        return current + length;
+     }
+ 
+     static int mutf8FromStringLength(String s) {

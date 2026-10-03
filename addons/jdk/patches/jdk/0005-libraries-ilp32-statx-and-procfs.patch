@@ -1,0 +1,27 @@
+diff --git a/src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c b/src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c
+index 5f81241b7dd7..88d11c6c41e3 100644
+--- a/src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c
++++ b/src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c
+@@ -74,7 +74,7 @@
+ // Alpine doesn't know these types, define them
+ typedef unsigned int       __uint32_t;
+ typedef unsigned short     __uint16_t;
+-typedef unsigned long int  __uint64_t;
++typedef unsigned long long __uint64_t;  // 64 bits on ILP32 (wasm32) too
+ #endif
+ 
+ /*
+diff --git a/src/jdk.management/unix/native/libmanagement_ext/OperatingSystemImpl.c b/src/jdk.management/unix/native/libmanagement_ext/OperatingSystemImpl.c
+index 81a972999edf..3aea81225707 100644
+--- a/src/jdk.management/unix/native/libmanagement_ext/OperatingSystemImpl.c
++++ b/src/jdk.management/unix/native/libmanagement_ext/OperatingSystemImpl.c
+@@ -70,7 +70,9 @@ static jlong page_size = 0;
+ /* This gets us the new structured proc interfaces of 5.6 & later */
+ /* - see comment in <sys/procfs.h> */
+ #define _STRUCTURED_PROC 1
++#ifndef __wasm__ /* not used; musl's has no wasm32 register sets */
+ #include <sys/procfs.h>
++#endif
+ 
+ #endif /* _ALLBSD_SOURCE */
+ 

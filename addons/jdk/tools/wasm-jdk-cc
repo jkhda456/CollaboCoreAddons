@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# The JDK build's C and C++ compiler for the guest (CC/CXX of the cross build): userspace/bin/wasm-cc
+# with libc++ for C++ (wasm-jdk-c++), the guest's link flags for programs, and without the flags
+# the JDK's configure gives clang on Linux that mean nothing for wasm32 (or that wasm-ld refuses).
+A="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$A/../.." && pwd)"
+LIBCXX="${JDK_LIBCXX:-$A/build/libcxx-install}"
+cxx=0; [[ "${1:-}" == --wasm-jdk-c++ ]] && { cxx=1; shift; }
+
+args=() link=1 partial=0 shared=0
+for a in "$@"; do
+  case "$a" in
+    -fuse-ld=*|-Wl,--exclude-libs,*|-Wl,-z,noexecstack|-Wl,-z,relro|-Wl,-z,now|-Wl,-z,defs \
+    |-Wl,--hash-style=*|-Wl,-soname,*|-Wl,-soname=*|-Wl,-rpath,*|-Wl,-rpath-link,*|-Wl,-O1 \
+    |-fstack-protector*|-fPIC|-fpic|-mno-omit-leaf-frame-pointer|-mstack-alignment=*|-m32|-m64 \
+    |-Wl,--allow-shlib-undefined|-Wl,--no-undefined|-Wl,-z,origin|-Wl,--enable-new-dtags|-Wl,--disable-new-dtags \
+    |-Wl,--version-script=*|-Wl,--export-dynamic|-rdynamic|-Wl,--undefined=*|-fasynchronous-unwind-tables \
+    |-fno-asynchronous-unwind-tables|-pthread|-Wl,-z,lazy|-Wl,--gc-sections|-Wl,-z,max-page-size=* \
+    |-fPIE|-pie|-latomic|-lrt|-ldl|-lpthread)
+      continue ;;
+    -c|-S|-E|-M|-MM) link=0 ;;
+    c++|c++-header|*.cpp|*.cc|*.cxx|*.hpp) cxx=1 ;;  # `-x c++-header` (the precompiled header) and C++ sources
+    -r|-Wl,-r) partial=1 ;;
+    -shared) shared=1 ;;
+  esac
+  args+=("$a")
+done
+for a in "${args[@]}"; do case "$a" in -print-*|--version|-v|-dumpmachine) exec "$ROOT/userspace/bin/wasm-cc" "${args[@]}";; esac; done
+
+# compat/: what musl leaves out on wasm (mmap and the like, fork), emulated (libwasmcompat.a)
+pre=(-I"$A/compat/include") post=()
+if [[ $cxx == 1 && $link == 0 ]]; then
+  # wasm-cc's compile, with libc++'s headers ahead of the C library's (wasm-cc puts the sysroot's
+  # first, and libc++'s <cstddef> must find its own <stddef.h>)
+  exec "${WASM_CC_BIN:-clang-19}" --target=wasm32 -matomics -mbulk-memory -mllvm -wasm-enable-sjlj \
+    -D__linux__=1 -D__linux=1 -D__unix__=1 -D__unix=1 -D__gnu_linux__=1 \
+    -Wno-unused-command-line-argument -Wno-override-module \
+    "${pre[@]}" -nostdinc++ -isystem "$LIBCXX/include/c++/v1" -isystem "$LIBCXX/include" \
+    -isystem "$ROOT/userspace/sysroot/include" "${args[@]}"
+fi
+if [[ $link == 1 && $partial == 0 ]]; then
+  # A shared library cannot be made for the guest; the JDK's static libraries are what is used.
+  [[ $shared == 1 ]] && { echo "wasm-jdk-cc: no shared libraries for wasm32" >&2; exit 1; }
+  # a program with the JVM in it gets the table of functions dlsym() finds (tools/gen-symtab.py)
+  inputs=() jvm=0
+  for a in "${args[@]}"; do
+    case "$a" in
+      @*) [[ -f "${a#@}" ]] && for f in $(cat "${a#@}"); do f="${f//\"/}"; case "$f" in *.o|*.a) inputs+=("$f");; esac; done ;;
+      *.o|*.a) inputs+=("$a") ;;
+    esac
+  done
+  for f in "${inputs[@]}"; do [[ "$(basename "$f")" == libjvm.a ]] && jvm=1; done
+  if [[ $jvm == 1 ]]; then
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    python3 "$A/tools/gen-symtab.py" "$tmp/symtab.c" "${inputs[@]}" || exit 1
+    "$ROOT/userspace/bin/wasm-cc" -O1 -c "$tmp/symtab.c" -o "$tmp/symtab.o" || exit 1
+    post+=("$tmp/symtab.o")
+  fi
+  post+=("$A/build/deps/compat/libwasmcompat.a")
+  [[ $cxx == 1 ]] && post+=("$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a")
+  post+=(-Wl,--wrap=pthread_getattr_np -Wl,--import-memory -Wl,--max-memory=4294967296 -Wl,--shared-memory -Wl,--export-table
+         "-Wl,-z,stack-size=${WASM_STACK_SIZE:-8388608}")
+fi
+if [[ -n "${JDK_WASM_KEEP_NAMES:-}" && $link == 1 && $partial == 0 ]]; then
+  # debugging: wasm-cc's link, but the wasm-opt pass keeps the function names (-g), so that the
+  # engine's backtraces of a trap name the functions
+  out=a.out
+  for ((i = 0; i < ${#args[@]}; i++)); do [[ "${args[i]}" == -o ]] && out="${args[i+1]}"; done
+  SYS="$ROOT/userspace/sysroot"
+  clang-19 --target=wasm32 -matomics -mbulk-memory -mllvm -wasm-enable-sjlj -Wno-unused-command-line-argument \
+    -nostdlib -fuse-ld=/usr/bin/wasm-ld-19 -Wl,--table-base=3 -L"$SYS/lib" "$SYS/lib/crt1.o" \
+    "${pre[@]}" "${args[@]}" "${post[@]}" -lc "$ROOT/userspace/out/rt/lib/wasm32-unknown-unknown/libclang_rt.builtins.a" || exit
+  "$ROOT/.tools/binaryen/bin/wasm-opt" -all -g --translate-to-exnref "$out" -o "$out.exnref" && mv "$out.exnref" "$out"
+  exit
+fi
+"$ROOT/userspace/bin/wasm-cc" "${pre[@]}" "${args[@]}" "${post[@]}"

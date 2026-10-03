@@ -1,0 +1,241 @@
+diff --git a/src/hotspot/cpu/zero/zeroInterpreter_zero.cpp b/src/hotspot/cpu/zero/zeroInterpreter_zero.cpp
+index 38051d6d1e2b..e33a320351e1 100644
+--- a/src/hotspot/cpu/zero/zeroInterpreter_zero.cpp
++++ b/src/hotspot/cpu/zero/zeroInterpreter_zero.cpp
+@@ -102,6 +102,9 @@ InterpreterCodelet* ZeroInterpreter::codelet_containing(address pc) {
+ 
+ int ZeroInterpreter::normal_entry(Method* method, intptr_t UNUSED, TRAPS) {
+   JavaThread *thread = THREAD;
++#ifdef __wasm__
++  wasm_preemption_point();
++#endif
+ 
+   // Allocate and initialize our frame.
+   InterpreterFrame *frame = InterpreterFrame::build(method, CHECK_0);
+diff --git a/src/hotspot/os/linux/os_linux.cpp b/src/hotspot/os/linux/os_linux.cpp
+index 4469e7d26930..bee7abdb4894 100644
+--- a/src/hotspot/os/linux/os_linux.cpp
++++ b/src/hotspot/os/linux/os_linux.cpp
+@@ -1828,6 +1828,9 @@ void * os::dll_load(const char *filename, char *ebuf, int ebuflen) {
+   static  Elf32_Half running_arch_code=EM_RISCV;
+ #elif  (defined LOONGARCH64)
+   static  Elf32_Half running_arch_code=EM_LOONGARCH;
++#elif  (defined __wasm__)
++  // nothing can be loaded: dlopen() of a file always fails in the WebAssembly guest
++  static  Elf32_Half running_arch_code=EM_NONE;
+ #else
+     #error Method os::dll_load requires that one of following is defined:\
+         AARCH64, ALPHA, ARM, AMD64, IA32, LOONGARCH64, M68K, MIPS, MIPSEL, PARISC, __powerpc__, __powerpc64__, RISCV, S390, SH, __sparc
+diff --git a/src/hotspot/os/linux/os_linux.inline.hpp b/src/hotspot/os/linux/os_linux.inline.hpp
+index f9d798404b5f..7b846696bdc5 100644
+--- a/src/hotspot/os/linux/os_linux.inline.hpp
++++ b/src/hotspot/os/linux/os_linux.inline.hpp
+@@ -31,11 +31,19 @@
+ #include "os_posix.inline.hpp"
+ 
+ inline bool os::zero_page_read_protected() {
++#ifdef __wasm__
++  return false;  // WebAssembly: address 0 is ordinary linear memory
++#else
+   return true;
++#endif
+ }
+ 
+ inline bool os::uses_stack_guard_pages() {
++#ifdef __wasm__
++  return false;  // WebAssembly: no page protection
++#else
+   return true;
++#endif
+ }
+ 
+ inline bool os::must_commit_stack_guard_pages() {
+diff --git a/src/hotspot/os/posix/os_posix.cpp b/src/hotspot/os/posix/os_posix.cpp
+index 0b514cd29a92..b047568e4b45 100644
+--- a/src/hotspot/os/posix/os_posix.cpp
++++ b/src/hotspot/os/posix/os_posix.cpp
+@@ -761,7 +761,9 @@ bool os::has_allocatable_memory_limit(size_t* limit) {
+     *limit = (size_t)rlim.rlim_cur;
+     result = true;
+   }
+-#ifdef _LP64
++#if defined(_LP64) || defined(__wasm__)
++  // WebAssembly: no probing below. Reserving memory takes it for good there (the linear memory
++  // only grows), so a reservation of nearly 4 GiB to find the limit would keep it all.
+   return result;
+ #else
+   // arbitrary virtual space limit for 32 bit Unices found by testing. If
+@@ -1597,7 +1599,21 @@ PlatformEvent::PlatformEvent() {
+   _nParked = 0;
+ }
+ 
++#ifdef __wasm__
++// The WebAssembly guest's kernel (before addons/mod/0008) keys futexes by address alone, though
++// each process has its own memory: when two JVMs run (jshell and its agent, say), a wake in one
++// can go to a thread of the other waiting at the same address, and the thread it was meant for
++// sleeps on. park() may return spuriously, and the callers of an untimed Monitor::wait() re-check
++// their condition, so untimed waits here wake up every WASM_WAKEUP_POLL_MS: a lost wake-up then
++// costs that much time instead of a hang.
++static const jlong WASM_WAKEUP_POLL_MS = 100;
++#endif
++
+ void PlatformEvent::park() {       // AKA "down()"
++#ifdef __wasm__
++  park(WASM_WAKEUP_POLL_MS);
++  return;
++#endif
+   // Transitions for _event:
+   //   -1 => -1 : illegal
+   //    1 =>  0 : pass - return immediately
+@@ -1822,9 +1838,16 @@ void Parker::park(bool isAbsolute, jlong time) {
+   assert(_cur_index == -1, "invariant");
+   if (time == 0) {
+     _cur_index = REL_INDEX; // arbitrary choice when not timed
++#ifdef __wasm__
++    // a spurious return now and then (see WASM_WAKEUP_POLL_MS)
++    to_abstime(&absTime, millis_to_nanos(WASM_WAKEUP_POLL_MS), false, false);
++    status = pthread_cond_timedwait(&_cond[_cur_index], _mutex, &absTime);
++    assert_status(status == 0 || status == ETIMEDOUT, status, "cond_timedwait");
++#else
+     status = pthread_cond_wait(&_cond[_cur_index], _mutex);
+     assert_status(status == 0 MACOS_ONLY(|| status == ETIMEDOUT),
+                   status, "cond_wait");
++#endif
+   }
+   else {
+     _cur_index = isAbsolute ? ABS_INDEX : REL_INDEX;
+@@ -1999,9 +2022,17 @@ int PlatformMonitor::wait(uint64_t millis) {
+     }
+     return ret;
+   } else {
++#ifdef __wasm__
++    // a spurious return now and then (see WASM_WAKEUP_POLL_MS)
++    struct timespec abst;
++    to_abstime(&abst, millis_to_nanos(WASM_WAKEUP_POLL_MS), false, false);
++    int status = pthread_cond_timedwait(cond(), mutex(), &abst);
++    assert_status(status == 0 || status == ETIMEDOUT, status, "cond_timedwait");
++#else
+     int status = pthread_cond_wait(cond(), mutex());
+     assert_status(status == 0 MACOS_ONLY(|| status == ETIMEDOUT),
+                   status, "cond_wait");
++#endif
+     return OS_OK;
+   }
+ }
+diff --git a/src/hotspot/os_cpu/linux_zero/os_linux_zero.cpp b/src/hotspot/os_cpu/linux_zero/os_linux_zero.cpp
+index c9ac461851a6..b746816cbf7c 100644
+--- a/src/hotspot/os_cpu/linux_zero/os_linux_zero.cpp
++++ b/src/hotspot/os_cpu/linux_zero/os_linux_zero.cpp
+@@ -100,6 +100,8 @@ address os::Posix::ucontext_get_pc(const ucontext_t* uc) {
+     return (address)uc->uc_mcontext.__gregs[REG_PC];
+ #elif defined(S390)
+     return (address)uc->uc_mcontext.psw.addr;
++#elif defined(__wasm__)
++    return nullptr; // WebAssembly: a signal comes with no machine context
+ #else
+     // Non-arch-specific Zero code does not really know the PC.
+     // If possible, add the arch-specific definition in this method.
+@@ -131,6 +133,8 @@ intptr_t* os::Linux::ucontext_get_sp(const ucontext_t* uc) {
+     return (intptr_t*)uc->uc_mcontext.__gregs[REG_SP];
+ #elif defined(S390)
+     return (intptr_t*)uc->uc_mcontext.gregs[15/*REG_SP*/];
++#elif defined(__wasm__)
++    return nullptr; // WebAssembly: a signal comes with no machine context
+ #else
+     // Non-arch-specific Zero code does not really know the SP.
+     // If possible, add the arch-specific definition in this method.
+@@ -158,6 +162,8 @@ intptr_t* os::Linux::ucontext_get_fp(const ucontext_t* uc) {
+     return (intptr_t*)uc->uc_mcontext.__gregs[8 /* REG_FP */];
+ #elif defined(S390)
+     return nullptr;
++#elif defined(__wasm__)
++    return nullptr; // WebAssembly: a signal comes with no machine context
+ #else
+     // Non-arch-specific Zero code does not really know the FP.
+     // If possible, add the arch-specific definition in this method.
+diff --git a/src/hotspot/share/interpreter/zero/bytecodeInterpreter.cpp b/src/hotspot/share/interpreter/zero/bytecodeInterpreter.cpp
+index 07ec57a6ffe8..45c1d1ea1037 100644
+--- a/src/hotspot/share/interpreter/zero/bytecodeInterpreter.cpp
++++ b/src/hotspot/share/interpreter/zero/bytecodeInterpreter.cpp
+@@ -72,7 +72,7 @@
+  * that implement the opcode (see UPDATE_PC_AND_TOS_AND_CONTINUE macro).
+  */
+ #undef USELABELS
+-#ifdef __GNUC__
++#if defined(__GNUC__) && !defined(__wasm__)
+ /*
+    ASSERT signifies debugging. It is much easier to step thru bytecodes if we
+    don't use the computed goto approach.
+@@ -302,7 +302,24 @@ JRT_END
+ 
+ #define METHOD istate->method()
+ #define GET_METHOD_COUNTERS(res)
++#ifdef __wasm__
++/*
++ * The WebAssembly guest: nothing preempts a thread that runs Java code (wasm code runs until it
++ * calls out), and the guest kernel takes its interrupts, timers and rescheduling on a CPU only
++ * when a thread there enters the kernel. A long loop would keep a CPU from all of it, and keep the
++ * VM from its safepoints. So a backward branch checks for a safepoint, as the other interpreters
++ * do, and every so often makes a system call (wasm_preemption_point()).
++ */
++#define DO_BACKEDGE_CHECKS(skip, branch_pc)                     \
++    if ((skip) <= 0) {                                          \
++      if (SafepointMechanism::should_process(THREAD)) {         \
++        CALL_VM(at_safepoint(THREAD), handle_exception);        \
++      }                                                         \
++      wasm_preemption_point();                                  \
++    }
++#else
+ #define DO_BACKEDGE_CHECKS(skip, branch_pc)
++#endif
+ 
+ /*
+  * For those opcodes that need to have a GC point on a backwards branch
+diff --git a/src/hotspot/share/interpreter/zero/bytecodeInterpreter.hpp b/src/hotspot/share/interpreter/zero/bytecodeInterpreter.hpp
+index 9941055bfd41..a1de78004580 100644
+--- a/src/hotspot/share/interpreter/zero/bytecodeInterpreter.hpp
++++ b/src/hotspot/share/interpreter/zero/bytecodeInterpreter.hpp
+@@ -50,6 +50,19 @@ union VMJavaVal64 {
+ 
+ typedef class BytecodeInterpreter* interpreterState;
+ 
++#ifdef __wasm__
++#include <sys/syscall.h>
++#include <unistd.h>
++// The WebAssembly guest: every so often (on backward branches and method entries), a system call,
++// the one way to let the guest kernel in on this CPU (see DO_BACKEDGE_CHECKS).
++inline void wasm_preemption_point() {
++  static THREAD_LOCAL unsigned count = 0;
++  if ((++count & 0x3fff) == 0) {
++    syscall(SYS_getppid);
++  }
++}
++#endif
++
+ struct call_message {
+   class Method* _callee;           // method to call during call_method request
+   address _callee_entry_point;     // address to jump to for call_method request
+diff --git a/src/hotspot/share/logging/logOutputList.cpp b/src/hotspot/share/logging/logOutputList.cpp
+index fab06860a480..92146eab37ce 100644
+--- a/src/hotspot/share/logging/logOutputList.cpp
++++ b/src/hotspot/share/logging/logOutputList.cpp
+@@ -26,6 +26,7 @@
+ #include "memory/allocation.inline.hpp"
+ #include "runtime/atomic.hpp"
+ #include "runtime/orderAccess.hpp"
++#include "runtime/os.hpp"
+ #include "utilities/globalDefinitions.hpp"
+ 
+ jint LogOutputList::increase_readers() {
+@@ -44,6 +45,11 @@ void LogOutputList::wait_until_no_readers() const {
+   OrderAccess::storeload();
+   while (Atomic::load(&_active_readers) != 0) {
+     // Busy wait
++#ifdef __wasm__
++    // Nothing preempts a thread in the WebAssembly guest: until this one enters the kernel, its
++    // CPU runs nothing else, takes no timers, and a reader waiting there for it never finishes.
++    os::naked_yield();
++#endif
+   }
+   // Prevent mutations to the output list to float above the active reader check.
+   // Such a reordering would lead to readers loading faulty data.

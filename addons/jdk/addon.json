@@ -1,0 +1,4 @@
+{
+  "name": "jdk",
+  "description": "jdk: OpenJDK 25 in the guest (HotSpot's Zero interpreter for wasm32) with java, javac, jar, jshell, javadoc, jlink and the JDK's other tools, and the class library of the JDK's modules other than the desktop ones"
+}

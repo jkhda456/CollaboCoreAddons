@@ -1,0 +1,144 @@
+diff --git a/src/java.base/share/native/launcher/main.c b/src/java.base/share/native/launcher/main.c
+index 4e42e03dfc7c..c2fcc0913aa4 100644
+--- a/src/java.base/share/native/launcher/main.c
++++ b/src/java.base/share/native/launcher/main.c
+@@ -37,6 +37,53 @@
+ /*
+  * Entry point.
+  */
++#ifdef __wasm__
++#include <string.h>
++
++/*
++ * The WebAssembly guest (collaboCore): the JDK is one static program, bin/java, and the JDK's
++ * tools in bin/ are links to it. The name it is run as picks the tool: its arguments, as the
++ * JDK's launchers for the tools have them built in (make/modules/<module>/Launcher.gmk).
++ */
++#define WASM_TOOL(name, wild, argfiles, ...) { name, wild, argfiles, { "-J-Xms8m", __VA_ARGS__ } }
++static const struct wasm_tool {
++    const char *name;
++    jboolean cpwildcard;
++    jboolean argfiles;
++    const char *jargs[8];
++} wasm_tools[] = {
++    WASM_TOOL("jar", JNI_FALSE, JNI_FALSE, "-m", "jdk.jartool/sun.tools.jar.Main"),
++    WASM_TOOL("jarsigner", JNI_FALSE, JNI_FALSE, "-m", "jdk.jartool/sun.security.tools.jarsigner.Main"),
++    WASM_TOOL("javac", JNI_TRUE, JNI_FALSE, "-J--add-modules", "-JALL-DEFAULT", "-m", "jdk.compiler/com.sun.tools.javac.Main"),
++    WASM_TOOL("javadoc", JNI_TRUE, JNI_FALSE, "-J--add-modules", "-JALL-DEFAULT", "-m", "jdk.javadoc/jdk.javadoc.internal.tool.Main"),
++    WASM_TOOL("javap", JNI_TRUE, JNI_FALSE, "-m", "jdk.jdeps/com.sun.tools.javap.Main"),
++    WASM_TOOL("jcmd", JNI_FALSE, JNI_FALSE, "-m", "jdk.jcmd/sun.tools.jcmd.JCmd"),
++    WASM_TOOL("jdb", JNI_FALSE, JNI_FALSE, "-m", "jdk.jdi/com.sun.tools.example.debug.tty.TTY"),
++    WASM_TOOL("jdeprscan", JNI_TRUE, JNI_FALSE, "-m", "jdk.jdeps/com.sun.tools.jdeprscan.Main"),
++    WASM_TOOL("jdeps", JNI_TRUE, JNI_FALSE, "-m", "jdk.jdeps/com.sun.tools.jdeps.Main"),
++    WASM_TOOL("jimage", JNI_FALSE, JNI_TRUE, "-m", "jdk.jlink/jdk.tools.jimage.Main"),
++    WASM_TOOL("jinfo", JNI_FALSE, JNI_FALSE, "-J-Dsun.jvm.hotspot.debugger.useProcDebugger",
++              "-J-Dsun.jvm.hotspot.debugger.useWindbgDebugger", "-m", "jdk.jcmd/sun.tools.jinfo.JInfo"),
++    WASM_TOOL("jlink", JNI_TRUE, JNI_TRUE, "-J--add-modules", "-JALL-DEFAULT", "-m", "jdk.jlink/jdk.tools.jlink.internal.Main"),
++    WASM_TOOL("jmap", JNI_FALSE, JNI_FALSE, "-J-Dsun.jvm.hotspot.debugger.useProcDebugger",
++              "-J-Dsun.jvm.hotspot.debugger.useWindbgDebugger", "-m", "jdk.jcmd/sun.tools.jmap.JMap"),
++    WASM_TOOL("jmod", JNI_TRUE, JNI_TRUE, "-m", "jdk.jlink/jdk.tools.jmod.Main"),
++    WASM_TOOL("jnativescan", JNI_TRUE, JNI_FALSE, "-m", "jdk.jdeps/com.sun.tools.jnativescan.Main"),
++    WASM_TOOL("jps", JNI_FALSE, JNI_FALSE, "-m", "jdk.jcmd/sun.tools.jps.Jps"),
++    WASM_TOOL("jshell", JNI_TRUE, JNI_FALSE, "-m", "jdk.jshell/jdk.internal.jshell.tool.JShellToolProvider"),
++    WASM_TOOL("jstack", JNI_FALSE, JNI_FALSE, "-J-Dsun.jvm.hotspot.debugger.useProcDebugger",
++              "-J-Dsun.jvm.hotspot.debugger.useWindbgDebugger", "-m", "jdk.jcmd/sun.tools.jstack.JStack"),
++    WASM_TOOL("jstat", JNI_FALSE, JNI_FALSE, "-m", "jdk.jcmd/sun.tools.jstat.Jstat"),
++    WASM_TOOL("jwebserver", JNI_FALSE, JNI_FALSE, "-m", "jdk.httpserver/sun.net.httpserver.simpleserver.JWebServer"),
++    WASM_TOOL("keytool", JNI_FALSE, JNI_FALSE, "-m", "java.base/sun.security.tools.keytool.Main"),
++    WASM_TOOL("kinit", JNI_FALSE, JNI_FALSE, "-m", "java.security.jgss/sun.security.krb5.internal.tools.Kinit"),
++    WASM_TOOL("klist", JNI_FALSE, JNI_FALSE, "-m", "java.security.jgss/sun.security.krb5.internal.tools.Klist"),
++    WASM_TOOL("ktab", JNI_FALSE, JNI_FALSE, "-m", "java.security.jgss/sun.security.krb5.internal.tools.Ktab"),
++    WASM_TOOL("rmiregistry", JNI_FALSE, JNI_FALSE, "-m", "java.rmi/sun.rmi.registry.RegistryImpl"),
++    WASM_TOOL("serialver", JNI_TRUE, JNI_FALSE, "-m", "jdk.compiler/sun.tools.serialver.SerialVer"),
++};
++#endif /* __wasm__ */
++
+ #ifdef JAVAW
+ 
+ char **__initenv;
+@@ -64,6 +111,30 @@ main(int argc, char **argv)
+         ? sizeof(const_jargs) / sizeof(char *)
+         : 0; // ignore the null terminator index
+ 
++#ifdef __wasm__
++    jboolean cpwildcard = const_cpwildcard;
++    jboolean disable_argfile = const_disable_argfile;
++    const char *progname = const_progname;
++    {
++        const char *name = strrchr(argv[0], '/');
++        size_t i;
++        name = name != NULL ? name + 1 : argv[0];
++        for (i = 0; i < sizeof(wasm_tools) / sizeof(wasm_tools[0]); i++) {
++            if (strcmp(name, wasm_tools[i].name) == 0) {
++                jargv = (const char **) wasm_tools[i].jargs;
++                for (jargc = 0; jargc < 8 && wasm_tools[i].jargs[jargc] != NULL; jargc++) {}
++                cpwildcard = wasm_tools[i].cpwildcard;
++                disable_argfile = !wasm_tools[i].argfiles;
++                progname = wasm_tools[i].name;
++                break;
++            }
++        }
++    }
++#define const_cpwildcard cpwildcard
++#define const_disable_argfile disable_argfile
++#define const_progname progname
++#endif
++
+     JLI_InitArgProcessing(jargc > 0, const_disable_argfile);
+ 
+ #ifdef _WIN32
+diff --git a/src/java.base/unix/native/libjli/java_md.c b/src/java.base/unix/native/libjli/java_md.c
+index 0a61971b080c..22d94265ab3d 100644
+--- a/src/java.base/unix/native/libjli/java_md.c
++++ b/src/java.base/unix/native/libjli/java_md.c
+@@ -33,6 +33,11 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
++#ifdef __wasm__
++#include <errno.h>
++#include <pthread.h>
++#include <time.h>
++#endif
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include "manifest_info.h"
+@@ -281,6 +286,9 @@ CreateExecutionEnvironment(int *pargc, char ***pargv,
+         // with the launcher executable. No need to manipulate LD_LIBRARY_PATH
+         // by adding <jdk_path>/lib and etc. The 'jrepath', 'jvmpath' and
+         // 'jvmcfg' are not used by the caller for static builds. Simply return.
++        // (The name of the executable is still needed: GetApplicationHome() for the tools'
++        // -Dapplication.home.)
++        SetExecname(*pargv);
+         return;
+     }
+ 
+@@ -686,7 +694,28 @@ CallJavaMainInNewThread(jlong stack_size, void* args) {
+ 
+     if (pthread_create(&tid, &attr, ThreadJavaMain, args) == 0) {
+         void* tmp;
++#ifdef __wasm__
++        /*
++         * The WebAssembly guest's kernel (before addons/mod/0008) keys futexes by address alone,
++         * though each process has its own memory: the exiting thread's wake can go to another
++         * JVM's launcher waiting at the same address, and this one would wait forever. Look
++         * again every 100 ms.
++         */
++        for (;;) {
++            struct timespec deadline;
++            clock_gettime(CLOCK_REALTIME, &deadline);
++            deadline.tv_nsec += 100 * 1000 * 1000;
++            if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
++                deadline.tv_sec++;
++                deadline.tv_nsec -= 1000 * 1000 * 1000;
++            }
++            if (pthread_timedjoin_np(tid, &tmp, &deadline) != ETIMEDOUT) {
++                break;
++            }
++        }
++#else
+         pthread_join(tid, &tmp);
++#endif
+         rslt = (int)(intptr_t)tmp;
+     } else {
+        /*

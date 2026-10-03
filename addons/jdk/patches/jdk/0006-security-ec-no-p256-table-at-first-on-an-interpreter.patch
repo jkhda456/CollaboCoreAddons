@@ -1,0 +1,34 @@
+diff --git a/src/java.base/share/classes/sun/security/ec/ECOperations.java b/src/java.base/share/classes/sun/security/ec/ECOperations.java
+index 2f94bb853424..e91d54c13547 100644
+--- a/src/java.base/share/classes/sun/security/ec/ECOperations.java
++++ b/src/java.base/share/classes/sun/security/ec/ECOperations.java
+@@ -204,6 +204,7 @@ public class ECOperations {
+     public MutablePoint multiply(AffinePoint affineP, byte[] s) {
+         PointMultiplier multiplier = null;
+         if (getField() instanceof IntegerMontgomeryFieldModuloP
++                && precomputedTableWorthIt()
+                 && affineP.equals(Secp256R1GeneratorMontgomeryMultiplier.generator)) {
+             // Lazy class loading here
+             multiplier = Secp256R1GeneratorMontgomeryMultiplier.multiplier;
+@@ -544,6 +545,21 @@ public class ECOperations {
+         }
+     }
+ 
++    // An interpreter (HotSpot's Zero, as in the WebAssembly port for collaboCore) takes about as
++    // long to build the secp256r1 generator's table as for 64 multiplications without it (some
++    // 2 seconds in the WebAssembly guest, 20 without Zero's multiplication in C: long enough for
++    // a TLS server to give up on the handshake), so it multiplies without the table (and without
++    // making it) for its first 64 multiplications on secp256r1.
++    private static final boolean INTERPRETER_ONLY =
++            jdk.internal.misc.VM.getSavedProperty("java.vm.info") != null
++            && jdk.internal.misc.VM.getSavedProperty("java.vm.info").contains("interpreted mode");
++    private static final java.util.concurrent.atomic.AtomicInteger generatorMultiplications =
++            new java.util.concurrent.atomic.AtomicInteger();
++
++    private static boolean precomputedTableWorthIt() {
++        return !INTERPRETER_ONLY || generatorMultiplications.incrementAndGet() > 64;
++    }
++
+     // Represents a multiplier with a larger precomputed table. Intended to be
+     // used for Basepoint multiplication
+     final static class Secp256R1GeneratorMontgomeryMultiplier

@@ -1,0 +1,17 @@
+diff --git a/make/autoconf/platform.m4 b/make/autoconf/platform.m4
+index 28aea489f7ec..692618128d0f 100644
+--- a/make/autoconf/platform.m4
++++ b/make/autoconf/platform.m4
+@@ -132,6 +132,12 @@ AC_DEFUN([PLATFORM_EXTRACT_VARS_FROM_CPU],
+       VAR_CPU_BITS=32
+       VAR_CPU_ENDIAN=little
+       ;;
++    wasm32)
++      VAR_CPU=wasm32
++      VAR_CPU_ARCH=wasm
++      VAR_CPU_BITS=32
++      VAR_CPU_ENDIAN=little
++      ;;
+     riscv64)
+       VAR_CPU=riscv64
+       VAR_CPU_ARCH=riscv

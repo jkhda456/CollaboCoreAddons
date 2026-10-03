@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The JDK build's C++ compiler for the guest: see wasm-jdk-cc. (A script, not a link: configure
+# resolves links, and the name is what picks C++.)
+exec "$(dirname "${BASH_SOURCE[0]}")/wasm-jdk-cc" --wasm-jdk-c++ "$@"
