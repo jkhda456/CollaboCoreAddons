@@ -1,0 +1,42 @@
+diff --git a/Source/WebKit/Scripts/webkit/messages.py b/Source/WebKit/Scripts/webkit/messages.py
+index 770da66d..1a07a6b6 100644
+--- a/Source/WebKit/Scripts/webkit/messages.py
++++ b/Source/WebKit/Scripts/webkit/messages.py
+@@ -952,6 +952,15 @@ def generate_runtime_enablement(receiver, message):
+     return 'sharedPreferences && %s' % runtime_enablement
+ 
+ 
++def complete_arguments_statement(receiver, message):
++    # The handler's address is taken before the templates that decode its arguments are
++    # instantiated, so a parameter type that is a class template specialization may not be complete
++    # yet; a function whose parameters are incomplete gets no signature of its own, and on
++    # WebAssembly the call through that address traps (wasm-ld: "function signature mismatch").
++    # Completing the argument types first gives the address the function's real type.
++    return '        static_assert(sizeof(Messages::%s::%s::Arguments));\n' % (receiver.name, message.name)
++
++
+ def async_message_statement(receiver, message):
+     def append_with_dispatch_function_args_and_particular_target_name(receiver, result, pattern, target_name):
+         if receiver.has_attribute(NOT_USING_IPC_CONNECTION_ATTRIBUTE) and message.reply_parameters is not None and not message.has_attribute(SYNCHRONOUS_ATTRIBUTE):
+@@ -997,11 +1006,13 @@ def async_message_statement(receiver, message):
+             result.append('            decoder.markInvalid();\n')
+             result.append('            return;\n')
+             result.append('        }\n')
++        result.append(complete_arguments_statement(receiver, message))
+         append_with_dispatch_function_args(receiver, result, '        IPC::%s<Messages::%s::%s>(%s%%s);\n' % (dispatch_function, receiver.name, message.name, connection))
+         result.append('        return;\n')
+         result.append('    }\n')
+     else:
+         result.append('    if (decoder.messageName() == Messages::%s::%s::name()) {\n' % (receiver.name, message.name))
++        result.append(complete_arguments_statement(receiver, message))
+         append_with_dispatch_function_args(receiver, result, '        IPC::%s<Messages::%s::%s>(%s%%s);\n' % (dispatch_function, receiver.name, message.name, connection))
+         result.append('        return;\n')
+         result.append('    }\n')
+@@ -1035,6 +1046,7 @@ def sync_message_statement(receiver, message):
+         result.append('    if (decoder.messageName() == Messages::%s::%s::name()) {\n' % (receiver.name, message.name))
+ 
+     def append_call_with_target_name(result, target_name):
++        result.append(complete_arguments_statement(receiver, message))
+         result.append('        IPC::%s<Messages::%s::%s>(connection, decoder%s, %s, &%s);\n' % (dispatch_function, receiver.name, message.name, maybe_reply_encoder, target_name, handler_function(receiver, message)))
+ 
+     if_swift_enabled(receiver, result, lambda x: append_call_with_target_name(x, 'target.get()'), lambda x: append_call_with_target_name(x, 'this'), )

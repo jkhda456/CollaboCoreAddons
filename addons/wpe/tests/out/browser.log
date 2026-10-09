@@ -1,0 +1,3 @@
+wpe-browser: "web" ready on /tmp/.collabo-web/web.sock (display: WPEDisplayCollabo)
+CONSOLE SECURITY ERROR Not allowed to use restricted network port 9: http://127.0.0.1:9/
+wpe-browser: failed to load http://127.0.0.1:9/: Not allowed to use restricted network port

@@ -1,0 +1,12 @@
+--- a/meson.build	2026-10-03 21:52:45.593450863 +0000
++++ b/meson.build	2026-10-03 21:52:45.714804995 +0000
+@@ -2307,7 +2307,8 @@
+     return 0;
+   }'''
+ atomic_dep = []
+-if cc.links(libatomic_test_code, args : '-latomic', name : 'check for -latomic')
++# wasm32: the atomics are instructions; there is no libatomic (the compiler wrapper drops -latomic)
++if host_machine.cpu_family() != 'wasm32' and cc.links(libatomic_test_code, args : '-latomic', name : 'check for -latomic')
+   atomic_dep = cc.find_library('atomic')
+ endif
+ 

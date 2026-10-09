@@ -1,0 +1,22 @@
+--- a/src/mkheader.c
++++ b/src/mkheader.c
+@@ -118,6 +118,7 @@
+     {"armv7a-unknown-linux-gnueabihf" },
+     {"armv5-unknown-linux-musleabi"   },
+     {"armv6-unknown-linux-musleabihf" },
++    {"wasm32-unknown-linux-musl"      },  /* musl's 24-byte pthread_mutex_t on ILP32 */
+     {"armv7a-unknown-linux-androideabi", "arm-unknown-linux-androideabi" },
+ 
+     { NULL }
+@@ -677,6 +678,11 @@
+       return 1;
+     }
+   host_triplet_raw = argv[0];
++  /* wasm32: configure makes the native lock header with an objdump that cannot read
++   * WebAssembly objects (a lock of no size: "gpgrt fatal: sizeof lock obj" at run time);
++   * the one from syscfg, as when cross building.  */
++  if (!strncmp (host_triplet_raw, "wasm32-", 7))
++    cross_building = 1;
+   fname = argv[1];
+   config_h = argv[2];
+   hdr_version = argv[3];

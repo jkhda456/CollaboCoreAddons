@@ -1,0 +1,11 @@
+WPE 시험 페이지 (200000)
+http://127.0.0.1:8000/index.html
+
+# 안녕하세요, WPE
+
+This page checks the wpe add-on. 한국어 문장도 보여야 합니다.
+
+Name  [1] input text name "your name":   [2] select color: *red | green | blue  [3] button: Greet
+
+[4]Second page <http://127.0.0.1:8000/second.html> ·  [5]nowhere <https://example.invalid/>
+[6] button: Count 0

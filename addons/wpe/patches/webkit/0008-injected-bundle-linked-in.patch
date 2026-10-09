@@ -1,0 +1,24 @@
+diff --git a/Source/WebKit/WebProcess/InjectedBundle/glib/InjectedBundleGlib.cpp b/Source/WebKit/WebProcess/InjectedBundle/glib/InjectedBundleGlib.cpp
+index 16af1715..8f437413 100644
+--- a/Source/WebKit/WebProcess/InjectedBundle/glib/InjectedBundleGlib.cpp
++++ b/Source/WebKit/WebProcess/InjectedBundle/glib/InjectedBundleGlib.cpp
+@@ -32,10 +32,19 @@
+ #include <wtf/FileSystem.h>
+ #include <wtf/text/CString.h>
+ 
++// Where nothing is loaded at run time (a static WebKit: WebAssembly), the bundle is linked into
++// the program, and so is its entry point; elsewhere this is null and the bundle is loaded.
++extern "C" __attribute__((weak)) void WKBundleInitialize(WKBundleRef, WKTypeRef);
++
+ namespace WebKit {
+ 
+ bool InjectedBundle::initialize(const WebProcessCreationParameters&, RefPtr<API::Object>&& initializationUserData)
+ {
++    if (WKBundleInitialize) {
++        WKBundleInitialize(toAPI(this), toAPI(initializationUserData.get()));
++        return true;
++    }
++
+     m_platformBundle = g_module_open(FileSystem::fileSystemRepresentation(m_path).data(), G_MODULE_BIND_LOCAL);
+     if (!m_platformBundle) {
+         g_warning("Error loading the injected bundle (%s): %s", m_path.utf8().data(), g_module_error());

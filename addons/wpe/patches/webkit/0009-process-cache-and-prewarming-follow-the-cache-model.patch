@@ -1,0 +1,25 @@
+diff --git a/Source/WebKit/UIProcess/WebProcessPool.cpp b/Source/WebKit/UIProcess/WebProcessPool.cpp
+index 1027b7d8..48da699a 100644
+--- a/Source/WebKit/UIProcess/WebProcessPool.cpp
++++ b/Source/WebKit/UIProcess/WebProcessPool.cpp
+@@ -1508,6 +1508,11 @@ void WebProcessPool::didReachGoodTimeToPrewarm()
+     if (!configuration().isAutomaticProcessWarmingEnabled() || !configuration().processSwapsOnNavigation() || usesSingleWebProcess())
+         return;
+ 
++    // A client that asks for less caching than a primary web browser (DocumentViewer,
++    // DocumentBrowser: memory before speed) gets no process started ahead either.
++    if (LegacyGlobalSettings::singleton().cacheModel() != CacheModel::PrimaryWebBrowser)
++        return;
++
+     if (MemoryPressureHandler::singleton().isUnderMemoryPressure()) {
+         WEBPROCESSPOOL_RELEASE_LOG(PerformanceLogging, "prewarmProcess: Not prewarming a WebProcess due to memory pressure");
+         return;
+@@ -1714,6 +1719,8 @@ void WebProcessPool::updateBackForwardCacheCapacity()
+ void WebProcessPool::setCacheModel(CacheModel cacheModel)
+ {
+     updateBackForwardCacheCapacity();
++    // the process cache's capacity follows the cache model too (none but for PrimaryWebBrowser)
++    m_webProcessCache->updateCapacity(*this);
+ 
+     sendToAllProcesses(Messages::WebProcess::SetCacheModel(cacheModel));
+ 

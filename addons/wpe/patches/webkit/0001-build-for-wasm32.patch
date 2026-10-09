@@ -1,0 +1,189 @@
+diff --git a/Source/JavaScriptCore/API/glib/JSCOptions.cpp b/Source/JavaScriptCore/API/glib/JSCOptions.cpp
+index 26f7120a..bfb7f3f1 100644
+--- a/Source/JavaScriptCore/API/glib/JSCOptions.cpp
++++ b/Source/JavaScriptCore/API/glib/JSCOptions.cpp
+@@ -74,7 +74,8 @@ static void valueToGValue(int32_t value, GValue* gValue)
+     g_value_set_int(gValue, value);
+ }
+ 
+-#if CPU(ADDRESS64)
++// On wasm32 size_t is unsigned long, another type than unsigned, as on 64-bit systems.
++#if CPU(ADDRESS64) || defined(__wasm__)
+ static bool valueFromGValue(const GValue* gValue, unsigned& value)
+ {
+     value = g_value_get_uint(gValue);
+@@ -561,7 +562,7 @@ static JSCOptionType jscOptionsType(int)
+     return JSC_OPTION_INT;
+ }
+ 
+-#if CPU(ADDRESS64)
++#if CPU(ADDRESS64) || defined(__wasm__)
+ static JSCOptionType jscOptionsType(unsigned)
+ {
+     return JSC_OPTION_UINT;
+diff --git a/Source/JavaScriptCore/bytecode/ExpressionInfo.cpp b/Source/JavaScriptCore/bytecode/ExpressionInfo.cpp
+index 8189d7c3..4c46d177 100644
+--- a/Source/JavaScriptCore/bytecode/ExpressionInfo.cpp
++++ b/Source/JavaScriptCore/bytecode/ExpressionInfo.cpp
+@@ -990,7 +990,7 @@ void ExpressionInfo::dumpEncodedInfo(ExpressionInfo::EncodedInfo* start, Express
+     EncodedInfo* curr = start;
+     for (unsigned index = 0; curr < end; ++index) {
+         unsigned value = curr->value;
+-        out.print("  [", index, "] ", RawPointer(curr), ": ", RawHex(value));
++        out.print("  [", index, "] ", RawPointer(curr), ": ", RawHex(static_cast<uintptr_t>(value)));
+ 
+         if (isWideOrSpecial(value)) {
+             bool isSpecial = ExpressionInfo::isSpecial(value);
+@@ -1012,7 +1012,7 @@ void ExpressionInfo::dumpEncodedInfo(ExpressionInfo::EncodedInfo* start, Express
+                 unsigned numberOfFields = (value >> multiSizeShift) & multiSizeMask;
+                 unsigned fieldShift = multiFirstFieldShift;
+ 
+-                out.print(" MLT ", RawHex(value), " numFields ", numberOfFields);
++                out.print(" MLT ", RawHex(static_cast<uintptr_t>(value)), " numFields ", numberOfFields);
+                 for (unsigned i = 1; i <= numberOfFields; ++i) {
+                     auto fieldID = static_cast<FieldID>((value >> fieldShift) & fieldIDMask);
+                     out.print(" | ", fieldID);
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index 683bc60a..4a253859 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -233,7 +233,8 @@ std::optional<OptionsStorage::Unsigned> parse(const char* string)
+     return std::nullopt;
+ }
+ 
+-#if CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU)
++// where size_t is not unsigned (WebAssembly's 32 bits: unsigned long)
++#if CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU) || defined(__wasm32__)
+ template<>
+ std::optional<OptionsStorage::Size> parse(const char* string)
+ {
+@@ -242,7 +243,7 @@ std::optional<OptionsStorage::Size> parse(const char* string)
+         return value;
+     return std::nullopt;
+ }
+-#endif // CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU)
++#endif // CPU(ADDRESS64) || OS(DARWIN) || OS(HAIKU) || defined(__wasm32__)
+ 
+ template<>
+ std::optional<OptionsStorage::Double> parse(const char* string)
+diff --git a/Source/ThirdParty/skia/modules/skcms/src/skcms_internals.h b/Source/ThirdParty/skia/modules/skcms/src/skcms_internals.h
+index f83c28a0..e664220a 100644
+--- a/Source/ThirdParty/skia/modules/skcms/src/skcms_internals.h
++++ b/Source/ThirdParty/skia/modules/skcms/src/skcms_internals.h
+@@ -48,7 +48,7 @@ extern "C" {
+         //   (http://crbug.com/1505442)
+         #if __has_cpp_attribute(clang::musttail) && !__has_feature(memory_sanitizer) \
+                                                  && !__has_feature(address_sanitizer) \
+-                                                 && !defined(__EMSCRIPTEN__) \
++                                                 && !defined(__EMSCRIPTEN__) && !defined(__wasm__) \
+                                                  && !defined(__arm__) \
+                                                  && !defined(__riscv) \
+                                                  && !defined(__powerpc__) \
+diff --git a/Source/ThirdParty/skia/src/core/SkRasterPipeline.h b/Source/ThirdParty/skia/src/core/SkRasterPipeline.h
+index feb9cc04..768e6211 100644
+--- a/Source/ThirdParty/skia/src/core/SkRasterPipeline.h
++++ b/Source/ThirdParty/skia/src/core/SkRasterPipeline.h
+@@ -27,7 +27,7 @@ enum SkColorType : int;
+ struct SkImageInfo;
+ struct skcms_TransferFunction;
+ 
+-#if __has_cpp_attribute(clang::musttail) && !defined(__EMSCRIPTEN__) && !defined(SK_CPU_ARM32) && \
++#if __has_cpp_attribute(clang::musttail) && !defined(__EMSCRIPTEN__) && !defined(__wasm__) && !defined(SK_CPU_ARM32) && \
+         !defined(SK_CPU_LOONGARCH) && !defined(SK_CPU_PPC) && \
+         !(defined(_WIN32) && defined(SK_BUILD_FOR_ANDROID_FRAMEWORK))
+     // [[clang::musttail]] is disabled for the Android version of Skia running on Windows as it
+diff --git a/Source/ThirdParty/xdgmime/CMakeLists.txt b/Source/ThirdParty/xdgmime/CMakeLists.txt
+index 43374cae..50974082 100644
+--- a/Source/ThirdParty/xdgmime/CMakeLists.txt
++++ b/Source/ThirdParty/xdgmime/CMakeLists.txt
+@@ -18,6 +18,8 @@ set(XDGMIME_SOURCES
+ 
+ include_directories("${XDGMIME_INCLUDE_DIRECTORIES}")
+ add_definitions(-DXDG_PREFIX=_wk_xdg)
++# what XDG_PREFIX leaves unprefixed, also in GIO's copy of xdgmime: linked statically together
++add_definitions(-D_caches=_wk_xdg_caches -D_xdg_binary_or_text_fallback=_wk_xdg_binary_or_text_fallback)
+ add_library(xdgmime STATIC ${XDGMIME_SOURCES})
+ 
+ if (CMAKE_CXX_BYTE_ORDER STREQUAL "LITTLE_ENDIAN")
+diff --git a/Source/WTF/wtf/dtoa/utils.h b/Source/WTF/wtf/dtoa/utils.h
+index 4ea62c77..5b67e8ea 100644
+--- a/Source/WTF/wtf/dtoa/utils.h
++++ b/Source/WTF/wtf/dtoa/utils.h
+@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
+     defined(__AARCH64EL__) || defined(__aarch64__) || defined(__AARCH64EB__) || \
+     defined(__riscv) || \
+     defined(__or1k__) || defined(__arc__) || \
+-    defined(__EMSCRIPTEN__)
++    defined(__EMSCRIPTEN__) || defined(__wasm__)
+ #define DOUBLE_CONVERSION_CORRECT_DOUBLE_OPERATIONS 1
+ #elif defined(__mc68000__) || \
+     defined(__pnacl__) || defined(__native_client__)
+diff --git a/Source/WTF/wtf/simde/arm/neon.h b/Source/WTF/wtf/simde/arm/neon.h
+index 828c8dd1..f300e5eb 100644
+--- a/Source/WTF/wtf/simde/arm/neon.h
++++ b/Source/WTF/wtf/simde/arm/neon.h
+@@ -8788,7 +8788,7 @@ SIMDE_BEGIN_DECLS_
+ #if !defined(SIMDE_FLOAT16_API)
+   #if defined(__ARM_FP16_FORMAT_IEEE) && (defined(SIMDE_ARM_NEON_FP16) || defined(__ARM_FP16_ARGS))
+     #define SIMDE_FLOAT16_API SIMDE_FLOAT16_API_FP16
+-  #elif !defined(__EMSCRIPTEN__) && !(defined(__clang__) && defined(SIMDE_ARCH_POWER)) && \
++  #elif !defined(__EMSCRIPTEN__) && !defined(__wasm__) && !(defined(__clang__) && defined(SIMDE_ARCH_POWER)) && \
+     !(defined(HEDLEY_MSVC_VERSION) && defined(__clang__)) && \
+     !(defined(SIMDE_ARCH_MIPS) && defined(__clang__)) && \
+     !(defined(SIMDE_ARCH_ZARCH) && defined(__clang__)) && \
+diff --git a/Source/WTF/wtf/simde/arm/sve.h b/Source/WTF/wtf/simde/arm/sve.h
+index 36b00f86..9b7f5ebf 100644
+--- a/Source/WTF/wtf/simde/arm/sve.h
++++ b/Source/WTF/wtf/simde/arm/sve.h
+@@ -8805,7 +8805,7 @@ SIMDE_BEGIN_DECLS_
+ #if !defined(SIMDE_FLOAT16_API)
+   #if defined(__ARM_FP16_FORMAT_IEEE) && (defined(SIMDE_ARM_NEON_FP16) || defined(__ARM_FP16_ARGS))
+     #define SIMDE_FLOAT16_API SIMDE_FLOAT16_API_FP16
+-  #elif !defined(__EMSCRIPTEN__) && !(defined(__clang__) && defined(SIMDE_ARCH_POWER)) && \
++  #elif !defined(__EMSCRIPTEN__) && !defined(__wasm__) && !(defined(__clang__) && defined(SIMDE_ARCH_POWER)) && \
+     !(defined(HEDLEY_MSVC_VERSION) && defined(__clang__)) && \
+     !(defined(SIMDE_ARCH_MIPS) && defined(__clang__)) && \
+     !(defined(SIMDE_ARCH_ZARCH) && defined(__clang__)) && \
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index ecf52b4c..7785b1ec 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -105,6 +105,7 @@ WEBKIT_OPTION_DEFINE(ENABLE_JOURNALD_LOG "Whether to enable journald logging" PU
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM "Whether to enable the WPEPlatform library" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_DRM "Whether to enable support for DRM platform" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_HEADLESS "Whether to enable support for headless platform" PUBLIC ON)
++WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_COLLABO "Whether to enable support for the collaboCore guest display (tools/gui)" PUBLIC OFF)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_PLATFORM_WAYLAND "Whether to enable support for Wayland platform" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_LEGACY_API "Whether to enable the WPE legacy API (libwpe)" PUBLIC ON)
+ WEBKIT_OPTION_DEFINE(ENABLE_WPE_QT_API "Whether to enable support for the Qt/QML plugin" PUBLIC ${ENABLE_DEVELOPER_MODE})
+@@ -203,6 +204,11 @@ set(bmalloc_LIBRARY_TYPE OBJECT)
+ set(WTF_LIBRARY_TYPE OBJECT)
+ set(JavaScriptCore_LIBRARY_TYPE OBJECT)
+ set(WebCore_LIBRARY_TYPE OBJECT)
++# WebAssembly (the collaboCore guest): nothing can be loaded at run time, so libWPEWebKit is a
++# static library, linked whole into the one program that is every process of the browser.
++if (CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm32")
++    set(WebKit_LIBRARY_TYPE STATIC)
++endif ()
+ 
+ # These are shared variables, but we special case their definition so that we can use the
+ # CMAKE_INSTALL_* variables that are populated by the GNUInstallDirs macro.
+@@ -323,6 +329,10 @@ if (ENABLE_WPE_PLATFORM)
+         set(WPE_PLATFORM_HEADLESS ON)
+     endif ()
+ 
++    if (ENABLE_WPE_PLATFORM_COLLABO)
++        SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_COLLABO ON)
++    endif ()
++
+     if (ENABLE_WPE_PLATFORM_WAYLAND)
+         find_package(Wayland 1.20 REQUIRED)
+         find_package(WaylandProtocols 1.24 REQUIRED)
+@@ -342,6 +352,7 @@ if (ENABLE_WPE_PLATFORM)
+ else ()
+     SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_DRM OFF)
+     SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_HEADLESS OFF)
++    SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_COLLABO OFF)
+     SET_AND_EXPOSE_TO_BUILD(ENABLE_WPE_PLATFORM_WAYLAND OFF)
+ endif ()
+ 

@@ -1,0 +1,217 @@
+diff --git a/Source/WebCore/platform/SharedMemory.cpp b/Source/WebCore/platform/SharedMemory.cpp
+index 5d6d48f4..a9a68055 100644
+--- a/Source/WebCore/platform/SharedMemory.cpp
++++ b/Source/WebCore/platform/SharedMemory.cpp
+@@ -97,6 +97,16 @@ std::optional<SharedMemoryHandle> SharedMemoryHandle::createVMCopy(std::span<con
+ }
+ #endif
+ 
++#if !(USE(UNIX_DOMAIN_SOCKETS) && !OS(ANDROID) && defined(__wasm__))
++void SharedMemory::flushForSharing(size_t, size_t)
++{
++}
++
++void SharedMemory::reloadFromSharer(size_t, size_t)
++{
++}
++#endif
++
+ std::optional<SharedMemoryHandle> SharedMemoryHandle::createCopy(std::span<const uint8_t> data, SharedMemoryProtection protection)
+ {
+     if (data.empty())
+diff --git a/Source/WebCore/platform/SharedMemory.h b/Source/WebCore/platform/SharedMemory.h
+index 68f798ab..738776c9 100644
+--- a/Source/WebCore/platform/SharedMemory.h
++++ b/Source/WebCore/platform/SharedMemory.h
+@@ -147,6 +147,13 @@ public:
+ 
+     WEBCORE_EXPORT Ref<WebCore::SharedBuffer> createSharedBuffer(size_t) const;
+ 
++    // Where processes share no memory (WebAssembly: each process is a memory of its own), a
++    // mapping is a copy of the memory file, written back when it is unmapped and when a handle is
++    // made. Memory written after it was shared needs these: flushForSharing() on the writer, then
++    // reloadFromSharer() on a reader, for the bytes [offset, offset + length). No-ops elsewhere.
++    WEBCORE_EXPORT void flushForSharing(size_t offset, size_t length);
++    WEBCORE_EXPORT void reloadFromSharer(size_t offset, size_t length);
++
+ private:
+ #if OS(DARWIN)
+     MachSendRight createSendRight(Protection) const;
+diff --git a/Source/WebCore/platform/graphics/ShareableBitmap.cpp b/Source/WebCore/platform/graphics/ShareableBitmap.cpp
+index 708bdd0e..a75ed917 100644
+--- a/Source/WebCore/platform/graphics/ShareableBitmap.cpp
++++ b/Source/WebCore/platform/graphics/ShareableBitmap.cpp
+@@ -179,6 +179,16 @@ ShareableBitmap::ShareableBitmap(const ShareableBitmapConfiguration& configurati
+     ASSERT(m_configuration.baseImageHeadroom() >= Headroom::None);
+ }
+ 
++void ShareableBitmap::flushForSharing()
++{
++    m_sharedMemory->flushForSharing(0, m_sharedMemory->size());
++}
++
++void ShareableBitmap::reloadFromSharer()
++{
++    m_sharedMemory->reloadFromSharer(0, m_sharedMemory->size());
++}
++
+ std::span<const uint8_t> ShareableBitmap::span() const LIFETIME_BOUND
+ {
+     return m_sharedMemory->span();
+diff --git a/Source/WebCore/platform/graphics/ShareableBitmap.h b/Source/WebCore/platform/graphics/ShareableBitmap.h
+index 714f4f7e..3b03e99f 100644
+--- a/Source/WebCore/platform/graphics/ShareableBitmap.h
++++ b/Source/WebCore/platform/graphics/ShareableBitmap.h
+@@ -213,6 +213,10 @@ public:
+     WEBCORE_EXPORT sk_sp<SkSurface> createSurface();
+ #endif
+ 
++    // SharedMemory::flushForSharing() / reloadFromSharer() for all of the bitmap's pixels.
++    WEBCORE_EXPORT void flushForSharing();
++    WEBCORE_EXPORT void reloadFromSharer();
++
+ private:
+     ShareableBitmap(const ShareableBitmapConfiguration&, Ref<SharedMemory>&&);
+ 
+diff --git a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+index c534f8fe..01b0e136 100644
+--- a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
++++ b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+@@ -80,6 +80,15 @@ static UnixFileDescriptor createSharedMemory()
+ {
+     int fileDescriptor = -1;
+ 
++#if defined(__wasm__)
++    // The guest kernel has no memfd_create system call; the C library's memfd_create (the add-on's
++    // compat library) makes an unlinked file in memory, which is the same thing here.
++    do {
++        fileDescriptor = memfd_create("WebKitSharedMemory", MFD_CLOEXEC);
++    } while (fileDescriptor == -1 && errno == EINTR);
++    return UnixFileDescriptor { fileDescriptor, UnixFileDescriptor::Adopt };
++#endif
++
+ #if HAVE(LINUX_MEMFD_H)
+     static bool isMemFdAvailable = true;
+     if (isMemFdAvailable) {
+@@ -156,6 +165,10 @@ RefPtr<SharedMemory> SharedMemory::map(Handle&& handle, Protection protection, C
+     RefPtr<SharedMemory> instance = adoptRef(new SharedMemory());
+     instance->m_data = data;
+     instance->m_size = handle.size();
++#if defined(__wasm__)
++    // kept to read what the sharer writes later (reloadFromSharer)
++    instance->m_fileDescriptor = WTF::move(handle.m_handle);
++#endif
+     return instance;
+ }
+ 
+@@ -185,6 +198,11 @@ auto SharedMemory::createHandle(Protection) -> std::optional<Handle>
+     // FIXME: Handle the case where the passed Protection is ReadOnly.
+     // See https://bugs.webkit.org/show_bug.cgi?id=131542.
+ 
++#if defined(__wasm__)
++    // The mapping is a copy of the file: what was written to it goes to the file first, so that
++    // the process that maps the handle reads it.
++    flushForSharing(0, m_size);
++#endif
+     UnixFileDescriptor duplicate { m_fileDescriptor.value(), UnixFileDescriptor::Duplicate };
+     if (!duplicate) {
+         ASSERT_NOT_REACHED();
+@@ -193,6 +211,44 @@ auto SharedMemory::createHandle(Protection) -> std::optional<Handle>
+     return { Handle(WTF::move(duplicate), m_size) };
+ }
+ 
++#if defined(__wasm__)
++void SharedMemory::flushForSharing(size_t offset, size_t length)
++{
++    if (!m_fileDescriptor || offset >= m_size)
++        return;
++    length = std::min(length, m_size - offset);
++    // what the mapping holds, written to the file (pwrite, not msync: a read-only mapping is not
++    // written back by the mmap emulation, and the range need not be page-aligned)
++    auto bytes = span().subspan(offset, length);
++    while (!bytes.empty()) {
++        ssize_t written = pwrite(m_fileDescriptor.value(), bytes.data(), bytes.size(), offset);
++        if (written < 0 && errno == EINTR)
++            continue;
++        if (written <= 0)
++            return;
++        bytes = bytes.subspan(written);
++        offset += written;
++    }
++}
++
++void SharedMemory::reloadFromSharer(size_t offset, size_t length)
++{
++    if (!m_fileDescriptor || offset >= m_size)
++        return;
++    length = std::min(length, m_size - offset);
++    auto bytes = mutableSpan().subspan(offset, length);
++    while (!bytes.empty()) {
++        ssize_t read = pread(m_fileDescriptor.value(), bytes.data(), bytes.size(), offset);
++        if (read < 0 && errno == EINTR)
++            continue;
++        if (read <= 0)
++            return;
++        bytes = bytes.subspan(read);
++        offset += read;
++    }
++}
++#endif
++
+ } // namespace WebCore
+ 
+ #endif // !OS(ANDROID) && USE(UNIX_DOMAIN_SOCKETS)
+diff --git a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+index 22c44ab7..c36714bd 100644
+--- a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
++++ b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+@@ -41,6 +41,9 @@
+ #include <drm/drm_fourcc.h>
+ #elif USE(LIBDRM)
+ #include <drm_fourcc.h>
++#else
++// without libdrm (no DMA-BUF buffers come then, but the code names the format)
++#define DRM_FORMAT_XRGB8888 0x34325258 // fourcc_code('X', 'R', '2', '4')
+ #endif
+ 
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+@@ -159,11 +162,14 @@ void AcceleratedBackingStore::didCreateSHMBuffer(uint64_t id, WebCore::Shareable
+     auto size = bitmap->size();
+     auto data = bitmap->span();
+     auto stride = bitmap->bytesPerRow();
++    auto* sharedBitmap = bitmap.get();
+     GRefPtr<GBytes> bytes = adoptGRef(g_bytes_new_with_free_func(data.data(), data.size(), [](gpointer userData) {
+         adoptRef(static_cast<WebCore::ShareableBitmap*>(userData));
+     }, bitmap.leakRef()));
+ 
+     GRefPtr<WPEBuffer> buffer = adoptGRef(WPE_BUFFER(wpe_buffer_shm_new(wpe_view_get_display(m_wpeView.get()), size.width(), size.height(), WPE_PIXEL_FORMAT_ARGB8888, bytes.get(), stride)));
++    // the bytes keep the bitmap alive as long as the buffer: frame() reloads it (see there)
++    g_object_set_data(G_OBJECT(buffer.get()), "wk-shm-bitmap", sharedBitmap);
+     m_bufferIDs.add(buffer.get(), id);
+     m_buffers.add(id, WTF::move(buffer));
+ 
+@@ -200,6 +206,11 @@ void AcceleratedBackingStore::frame(uint64_t bufferID, Rects&& damageRects, WTF:
+         return;
+     }
+ 
++    // Where processes share no memory, the buffer's pixels are a copy of the memory file the web
++    // process wrote this frame to (ShareableBitmap::flushForSharing): read them again.
++    if (auto* sharedBitmap = static_cast<WebCore::ShareableBitmap*>(g_object_get_data(G_OBJECT(buffer), "wk-shm-bitmap")))
++        sharedBitmap->reloadFromSharer();
++
+     m_pendingBuffer = buffer;
+     m_pendingDamageRects = WTF::move(damageRects);
+     if (wpe_display_use_explicit_sync(wpe_view_get_display(m_wpeView.get()))) {
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index f3daaef2..baac3fea 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -450,6 +450,8 @@ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame()
+             m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+         } else
+             m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
++        // where processes share no memory, the UI process reads the frame from the memory file
++        m_bitmap->flushForSharing();
+         return;
+     }
+ 

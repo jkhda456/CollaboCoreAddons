@@ -1,0 +1,288 @@
+Fix function pointer casts: functions called through pointers of their own type (interface init
+functions with the two parameters GLib calls them with, foreach/sort callbacks, OpenSSL's I/O
+functions): WebAssembly checks the type of every call through a pointer.
+
+diff -ruN glib-networking-pristine/tls/base/gtlsconnection-base.c glib-networking-fixed/tls/base/gtlsconnection-base.c
+--- a/tls/base/gtlsconnection-base.c	2026-10-03 23:23:22.675327619 +0000
++++ b/tls/base/gtlsconnection-base.c	2026-10-03 23:23:22.710285095 +0000
+@@ -169,9 +169,9 @@
+   gboolean     session_resumption_enabled;
+ } GTlsConnectionBasePrivate;
+ 
+-static void g_tls_connection_base_dtls_connection_iface_init (GDtlsConnectionInterface *iface);
++static void g_tls_connection_base_dtls_connection_iface_init (GDtlsConnectionInterface *iface, gpointer unused_1);
+ 
+-static void g_tls_connection_base_datagram_based_iface_init  (GDatagramBasedInterface  *iface);
++static void g_tls_connection_base_datagram_based_iface_init  (GDatagramBasedInterface  *iface, gpointer unused_1);
+ 
+ static gboolean do_implicit_handshake (GTlsConnectionBase  *tls,
+                                        gint64               timeout,
+@@ -2980,7 +2980,7 @@
+ }
+ 
+ static void
+-g_tls_connection_base_dtls_connection_iface_init (GDtlsConnectionInterface *iface)
++g_tls_connection_base_dtls_connection_iface_init (GDtlsConnectionInterface *iface, gpointer unused_1)
+ {
+   iface->handshake = g_tls_connection_base_dtls_handshake;
+   iface->handshake_async = g_tls_connection_base_dtls_handshake_async;
+@@ -2994,7 +2994,7 @@
+ }
+ 
+ static void
+-g_tls_connection_base_datagram_based_iface_init (GDatagramBasedInterface *iface)
++g_tls_connection_base_datagram_based_iface_init (GDatagramBasedInterface *iface, gpointer unused_1)
+ {
+   iface->receive_messages = g_tls_connection_base_receive_messages;
+   iface->send_messages = g_tls_connection_base_send_messages;
+diff -ruN glib-networking-pristine/tls/base/gtlsinputstream.c glib-networking-fixed/tls/base/gtlsinputstream.c
+--- a/tls/base/gtlsinputstream.c	2026-10-03 23:23:22.675327619 +0000
++++ b/tls/base/gtlsinputstream.c	2026-10-03 23:23:22.710471746 +0000
+@@ -34,7 +34,7 @@
+   GWeakRef weak_conn;
+ };
+ 
+-static void g_tls_input_stream_pollable_iface_init (GPollableInputStreamInterface *iface);
++static void g_tls_input_stream_pollable_iface_init (GPollableInputStreamInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (GTlsInputStream, g_tls_input_stream, G_TYPE_INPUT_STREAM,
+                                G_IMPLEMENT_INTERFACE (G_TYPE_POLLABLE_INPUT_STREAM, g_tls_input_stream_pollable_iface_init)
+@@ -244,7 +244,7 @@
+ }
+ 
+ static void
+-g_tls_input_stream_pollable_iface_init (GPollableInputStreamInterface *iface)
++g_tls_input_stream_pollable_iface_init (GPollableInputStreamInterface *iface, gpointer unused_1)
+ {
+   iface->is_readable = g_tls_input_stream_pollable_is_readable;
+   iface->create_source = g_tls_input_stream_pollable_create_source;
+diff -ruN glib-networking-pristine/tls/base/gtlsoutputstream.c glib-networking-fixed/tls/base/gtlsoutputstream.c
+--- a/tls/base/gtlsoutputstream.c	2026-10-03 23:23:22.675327619 +0000
++++ b/tls/base/gtlsoutputstream.c	2026-10-03 23:23:22.710647338 +0000
+@@ -34,7 +34,7 @@
+   GWeakRef weak_conn;
+ };
+ 
+-static void g_tls_output_stream_pollable_iface_init (GPollableOutputStreamInterface *iface);
++static void g_tls_output_stream_pollable_iface_init (GPollableOutputStreamInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (GTlsOutputStream, g_tls_output_stream, G_TYPE_OUTPUT_STREAM,
+                                G_IMPLEMENT_INTERFACE (G_TYPE_POLLABLE_OUTPUT_STREAM, g_tls_output_stream_pollable_iface_init)
+@@ -246,7 +246,7 @@
+ }
+ 
+ static void
+-g_tls_output_stream_pollable_iface_init (GPollableOutputStreamInterface *iface)
++g_tls_output_stream_pollable_iface_init (GPollableOutputStreamInterface *iface, gpointer unused_1)
+ {
+   iface->is_writable = g_tls_output_stream_pollable_is_writable;
+   iface->create_source = g_tls_output_stream_pollable_create_source;
+diff -ruN glib-networking-pristine/tls/openssl/gtlsbackend-openssl.c glib-networking-fixed/tls/openssl/gtlsbackend-openssl.c
+--- a/tls/openssl/gtlsbackend-openssl.c	2026-10-03 23:23:22.676410965 +0000
++++ b/tls/openssl/gtlsbackend-openssl.c	2026-10-03 23:23:22.710802482 +0000
+@@ -45,7 +45,7 @@
+   GTlsDatabase *default_database;
+ };
+ 
+-static void g_tls_backend_openssl_interface_init (GTlsBackendInterface *iface);
++static void g_tls_backend_openssl_interface_init (GTlsBackendInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_DYNAMIC_TYPE_EXTENDED (GTlsBackendOpenssl, g_tls_backend_openssl, G_TYPE_OBJECT, G_TYPE_FLAG_FINAL,
+                                 G_IMPLEMENT_INTERFACE_DYNAMIC (G_TYPE_TLS_BACKEND,
+@@ -232,7 +232,7 @@
+ }
+ 
+ static void
+-g_tls_backend_openssl_interface_init (GTlsBackendInterface *iface)
++g_tls_backend_openssl_interface_init (GTlsBackendInterface *iface, gpointer unused_1)
+ {
+   iface->get_certificate_type = g_tls_certificate_openssl_get_type;
+   iface->get_client_connection_type = g_tls_client_connection_openssl_get_type;
+diff -ruN glib-networking-pristine/tls/openssl/gtlscertificate-openssl.c glib-networking-fixed/tls/openssl/gtlscertificate-openssl.c
+--- a/tls/openssl/gtlscertificate-openssl.c	2026-10-03 23:23:22.676410965 +0000
++++ b/tls/openssl/gtlscertificate-openssl.c	2026-10-03 23:23:22.711184587 +0000
+@@ -69,7 +69,7 @@
+   PROP_PASSWORD,
+ };
+ 
+-static void     g_tls_certificate_openssl_initable_iface_init (GInitableIface  *iface);
++static void     g_tls_certificate_openssl_initable_iface_init (GInitableIface  *iface, gpointer unused_1);
+ static gboolean is_issuer (GTlsCertificateOpenssl *cert, GTlsCertificateOpenssl *issuer);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (GTlsCertificateOpenssl, g_tls_certificate_openssl, G_TYPE_TLS_CERTIFICATE,
+@@ -710,7 +710,7 @@
+ }
+ 
+ static void
+-g_tls_certificate_openssl_initable_iface_init (GInitableIface  *iface)
++g_tls_certificate_openssl_initable_iface_init (GInitableIface  *iface, gpointer unused_1)
+ {
+   iface->init = g_tls_certificate_openssl_initable_init;
+ }
+diff -ruN glib-networking-pristine/tls/openssl/gtlsclientconnection-openssl.c glib-networking-fixed/tls/openssl/gtlsclientconnection-openssl.c
+--- a/tls/openssl/gtlsclientconnection-openssl.c	2026-10-03 23:23:22.676410965 +0000
++++ b/tls/openssl/gtlsclientconnection-openssl.c	2026-10-03 23:23:22.711792750 +0000
+@@ -65,9 +65,9 @@
+   PROP_SESSION_REUSED
+ };
+ 
+-static void g_tls_client_connection_openssl_initable_interface_init (GInitableIface  *iface);
++static void g_tls_client_connection_openssl_initable_interface_init (GInitableIface  *iface, gpointer unused_1);
+ 
+-static void g_tls_client_connection_openssl_client_connection_interface_init (GTlsClientConnectionInterface *iface);
++static void g_tls_client_connection_openssl_client_connection_interface_init (GTlsClientConnectionInterface *iface, gpointer unused_1);
+ 
+ static GInitableIface *g_tls_client_connection_openssl_parent_initable_iface;
+ 
+@@ -316,7 +316,7 @@
+ }
+ 
+ static void
+-g_tls_client_connection_openssl_client_connection_interface_init (GTlsClientConnectionInterface *iface)
++g_tls_client_connection_openssl_client_connection_interface_init (GTlsClientConnectionInterface *iface, gpointer unused_1)
+ {
+   iface->copy_session_state = g_tls_client_connection_openssl_copy_session_state;
+ }
+@@ -589,7 +589,7 @@
+ }
+ 
+ static void
+-g_tls_client_connection_openssl_initable_interface_init (GInitableIface  *iface)
++g_tls_client_connection_openssl_initable_interface_init (GInitableIface  *iface, gpointer unused_1)
+ {
+   g_tls_client_connection_openssl_parent_initable_iface = g_type_interface_peek_parent (iface);
+ 
+diff -ruN glib-networking-pristine/tls/openssl/gtlsconnection-openssl.c glib-networking-fixed/tls/openssl/gtlsconnection-openssl.c
+--- a/tls/openssl/gtlsconnection-openssl.c	2026-10-03 23:23:22.677494310 +0000
++++ b/tls/openssl/gtlsconnection-openssl.c	2026-10-03 23:36:18.225711093 +0000
+@@ -53,6 +53,20 @@
+ 
+ typedef int (*GTlsOpensslIOFunc) (SSL *ssl, gpointer user_data);
+ 
++/* OpenSSL's functions as GTlsOpensslIOFuncs (the call passes user_data: on WebAssembly a function
++ * called through a pointer must take what the call gives) */
++static int
++ssl_do_handshake_io (SSL *ssl, gpointer user_data)
++{
++  return SSL_do_handshake (ssl);
++}
++
++static int
++ssl_shutdown_io (SSL *ssl, gpointer user_data)
++{
++  return SSL_shutdown (ssl);
++}
++
+ typedef struct _ReadRequest
+ {
+   void *buffer;
+@@ -65,7 +79,7 @@
+   gsize count;
+ } WriteRequest;
+ 
+-static void g_tls_connection_openssl_initable_iface_init (GInitableIface *iface);
++static void g_tls_connection_openssl_initable_iface_init (GInitableIface *iface, gpointer unused_1);
+ 
+ G_DEFINE_ABSTRACT_TYPE_WITH_CODE (GTlsConnectionOpenssl, g_tls_connection_openssl, G_TYPE_TLS_CONNECTION_BASE,
+                                   G_ADD_PRIVATE (GTlsConnectionOpenssl)
+@@ -840,7 +854,7 @@
+ 
+   status = perform_openssl_io (G_TLS_CONNECTION_OPENSSL (tls),
+                                G_IO_IN | G_IO_OUT,
+-                               (GTlsOpensslIOFunc) SSL_do_handshake,
++                               ssl_do_handshake_io,
+                                NULL, timeout, cancellable, &ret, error,
+                                N_("Error reading data from TLS socket"));
+ 
+@@ -1076,7 +1090,7 @@
+ 
+   return perform_openssl_io (G_TLS_CONNECTION_OPENSSL (tls),
+                              G_IO_IN | G_IO_OUT,
+-                             (GTlsOpensslIOFunc) SSL_shutdown,
++                             ssl_shutdown_io,
+                              NULL, timeout, cancellable, NULL, error,
+                              N_("Error performing TLS close"));
+ }
+@@ -1152,7 +1166,7 @@
+ }
+ 
+ static void
+-g_tls_connection_openssl_initable_iface_init (GInitableIface *iface)
++g_tls_connection_openssl_initable_iface_init (GInitableIface *iface, gpointer unused_1)
+ {
+   iface->init = g_tls_connection_openssl_initable_init;
+ }
+diff -ruN glib-networking-pristine/tls/openssl/gtlsdatabase-openssl.c glib-networking-fixed/tls/openssl/gtlsdatabase-openssl.c
+--- a/tls/openssl/gtlsdatabase-openssl.c	2026-10-03 23:23:22.677494310 +0000
++++ b/tls/openssl/gtlsdatabase-openssl.c	2026-10-03 23:23:22.712554703 +0000
+@@ -57,7 +57,7 @@
+   X509_STORE *store;
+ } GTlsDatabaseOpensslPrivate;
+ 
+-static void g_tls_database_openssl_initable_interface_init (GInitableIface *iface);
++static void g_tls_database_openssl_initable_interface_init (GInitableIface *iface, gpointer unused_1);
+ 
+ G_DEFINE_TYPE_WITH_CODE (GTlsDatabaseOpenssl, g_tls_database_openssl, G_TYPE_TLS_DATABASE,
+                          G_ADD_PRIVATE (GTlsDatabaseOpenssl)
+@@ -461,7 +461,7 @@
+ }
+ 
+ static void
+-g_tls_database_openssl_initable_interface_init (GInitableIface *iface)
++g_tls_database_openssl_initable_interface_init (GInitableIface *iface, gpointer unused_1)
+ {
+   iface->init = g_tls_database_openssl_initable_init;
+ }
+diff -ruN glib-networking-pristine/tls/openssl/gtlsfiledatabase-openssl.c glib-networking-fixed/tls/openssl/gtlsfiledatabase-openssl.c
+--- a/tls/openssl/gtlsfiledatabase-openssl.c	2026-10-03 23:23:22.677494310 +0000
++++ b/tls/openssl/gtlsfiledatabase-openssl.c	2026-10-03 23:23:22.712907648 +0000
+@@ -75,7 +75,7 @@
+   PROP_ANCHORS,
+ };
+ 
+-static void g_tls_file_database_openssl_file_database_interface_init (GTlsFileDatabaseInterface *iface);
++static void g_tls_file_database_openssl_file_database_interface_init (GTlsFileDatabaseInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (GTlsFileDatabaseOpenssl, g_tls_file_database_openssl, G_TYPE_TLS_DATABASE_OPENSSL,
+                                G_IMPLEMENT_INTERFACE (G_TYPE_TLS_FILE_DATABASE,
+@@ -538,6 +538,6 @@
+ }
+ 
+ static void
+-g_tls_file_database_openssl_file_database_interface_init (GTlsFileDatabaseInterface *iface)
++g_tls_file_database_openssl_file_database_interface_init (GTlsFileDatabaseInterface *iface, gpointer unused_1)
+ {
+ }
+diff -ruN glib-networking-pristine/tls/openssl/gtlsserverconnection-openssl.c glib-networking-fixed/tls/openssl/gtlsserverconnection-openssl.c
+--- a/tls/openssl/gtlsserverconnection-openssl.c	2026-10-03 23:23:22.677494310 +0000
++++ b/tls/openssl/gtlsserverconnection-openssl.c	2026-10-03 23:23:22.713296569 +0000
+@@ -47,9 +47,9 @@
+   PROP_AUTHENTICATION_MODE
+ };
+ 
+-static void g_tls_server_connection_openssl_initable_interface_init (GInitableIface  *iface);
++static void g_tls_server_connection_openssl_initable_interface_init (GInitableIface  *iface, gpointer unused_1);
+ 
+-static void g_tls_server_connection_openssl_server_connection_interface_init (GTlsServerConnectionInterface *iface);
++static void g_tls_server_connection_openssl_server_connection_interface_init (GTlsServerConnectionInterface *iface, gpointer unused_1);
+ 
+ static GInitableIface *g_tls_server_connection_openssl_parent_initable_iface;
+ 
+@@ -264,7 +264,7 @@
+ }
+ 
+ static void
+-g_tls_server_connection_openssl_server_connection_interface_init (GTlsServerConnectionInterface *iface)
++g_tls_server_connection_openssl_server_connection_interface_init (GTlsServerConnectionInterface *iface, gpointer unused_1)
+ {
+ }
+ 
+@@ -472,7 +472,7 @@
+ }
+ 
+ static void
+-g_tls_server_connection_openssl_initable_interface_init (GInitableIface  *iface)
++g_tls_server_connection_openssl_initable_interface_init (GInitableIface  *iface, gpointer unused_1)
+ {
+   g_tls_server_connection_openssl_parent_initable_iface = g_type_interface_peek_parent (iface);
+ 

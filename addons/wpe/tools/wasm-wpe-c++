@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The C++ compiler of the wpe add-on: see wasm-wpe-cc. (A script, not a link: build systems
+# resolve links, and the name is what picks C++.)
+exec "$(dirname "${BASH_SOURCE[0]}")/wasm-wpe-cc" --wasm-wpe-c++ "$@"

@@ -1,0 +1,78 @@
+random: crng init done
+printk: legacy bootconsole [earlycon0] enabled
+Linux version 7.1.5+ (work@work) (Ubuntu clang version 19.1.7 (20ubuntu4), Ubuntu LLD 19.1.7) # SMP 1970-01-01 00:00:00 UTC
+Heap:	(ptrval) -> (ptrval) = 22544
+Stack:	(ptrval) -> (ptrval) = 65536
+Core count: 2
+Zone ranges:
+  Normal   [mem 0x0000000000000000-0x00000000fffeffff]
+Movable zone start for each node
+Early memory node ranges
+  node   0: [mem 0x0000000000000000-0x00000000fffeffff]
+Initmem setup node 0 [mem 0x0000000000000000-0x00000000fffeffff]
+On node 0, zone Normal: 1 pages in unavailable ranges
+percpu: max_distance=0x20000 too large for vmalloc space 0x0
+percpu: Embedded 1 pages/cpu s17972 r0 d47564 u65536
+Kernel command line: console=hvc0 collabo.wasmstack=33554432 collabo.agent=1 collabo.quiet=1 collabo.ip=192.0.2.2 collabo.gw=192.0.2.1 collabo.mount=mount0:/t
+printk: log buffer data + meta data: 131072 + 409600 = 540672 bytes
+Dentry cache hash table entries: 524288 (order: 5, 2097152 bytes, linear)
+Inode-cache hash table entries: 262144 (order: 4, 1048576 bytes, linear)
+Sorting __ex_table...
+Built 1 zonelists, mobility grouping off.  Total pages: 65535
+mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=2, Nodes=1
+rcu: Hierarchical RCU implementation.
+rcu: 	RCU restricting CPUs from NR_CPUS=64 to nr_cpu_ids=2.
+rcu: RCU calculated value of scheduler-enlistment delay is 10 jiffies.
+rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=2
+NR_IRQS: 256
+IRQs enabled
+rcu: srcu_init: Setting srcu_struct sizes based on contention.
+clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+clocksource: wasm: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+Console: colour dummy device 80x25
+pid_max: default: 32768 minimum: 301
+Mount-cache hash table entries: 16384 (order: 0, 65536 bytes, linear)
+Mountpoint-cache hash table entries: 16384 (order: 0, 65536 bytes, linear)
+VFS: Finished mounting rootfs on nullfs
+rcu: Hierarchical SRCU implementation.
+rcu: 	Max phase no-delay instances is 1000.
+Timer migration: 1 hierarchy levels; 8 children per group; 1 crossnode level
+smp: Bringing up secondary CPUs ...
+Hello from cpu 1!
+smp: Brought up 1 node, 2 CPUs
+Memory: 3932096K/4194240K available (256640K reserved, 0K cma-reserved)
+devtmpfs: initialized
+posixtimers hash table entries: 1024 (order: 0, 12288 bytes, linear)
+futex hash table entries: 512 (32768 bytes on 1 NUMA nodes, total 32 KiB, linear).
+NET: Registered PF_NETLINK/PF_ROUTE protocol family
+pps_core: LinuxPPS API ver. 1 registered
+pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+PTP clock support registered
+clocksource: Switched to clocksource wasm
+NET: Registered PF_INET protocol family
+IP idents hash table entries: 65536 (order: 3, 524288 bytes, linear)
+tcp_listen_portaddr_hash hash table entries: 8192 (order: 1, 98304 bytes, linear)
+Table-perturb hash table entries: 65536 (order: 2, 262144 bytes, linear)
+TCP established hash table entries: 32768 (order: 1, 131072 bytes, linear)
+TCP bind hash table entries: 32768 (order: 4, 786432 bytes, linear)
+TCP: Hash tables configured (established 32768 bind 32768)
+UDP hash table entries: 2048 (order: 1, 114688 bytes, linear)
+NET: Registered PF_UNIX/PF_LOCAL protocol family
+workingset: timestamp_bits=30 (anon: 26) max_order=16 bucket_order=0 (anon: 0)
+squashfs: version 4.0 (2009/01/31) Phillip Lougher
+fuse: init (API version 7.45)
+io scheduler mq-deadline registered
+io scheduler kyber registered
+Unpacking initramfs...
+Freeing initrd memory: 249792K
+NET: Registered PF_VSOCK protocol family
+printk: legacy console [hvc0] enabled
+printk: legacy bootconsole [earlycon0] disabled
+virtiofs virtio3: discovered new tag: mount0
+This architecture does not have kernel memory protection.
+Run /init as init process
+
+init: collaboCore agent sandbox
+init: starting /bin/sh
+root@collabo:~# rm: can't remove '/t/out': Directory not empty

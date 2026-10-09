@@ -1,0 +1,4 @@
+{
+  "name": "wpe",
+  "description": "web: a web browser for agents (WPE WebKit 2.54 for the guest: JavaScript, CSS, fonts with Korean, cookies, downloads), driven from the command line (web open/read/click/type/...) and shown on the guest's display (gui)"
+}

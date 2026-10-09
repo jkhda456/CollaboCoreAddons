@@ -1,0 +1,384 @@
+diff --git a/Source/ThirdParty/xdgmime/src/xdgmime.c b/Source/ThirdParty/xdgmime/src/xdgmime.c
+index 1ad61a5e..7a486623 100644
+--- a/Source/ThirdParty/xdgmime/src/xdgmime.c
++++ b/Source/ThirdParty/xdgmime/src/xdgmime.c
+@@ -136,7 +136,8 @@ xdg_dir_time_list_free (XdgDirTimeList *list)
+ }
+ 
+ static int
+-xdg_mime_init_from_directory (const char *directory)
++xdg_mime_init_from_directory (const char *directory,
++                              void       *user_data)
+ {
+   char *file_name;
+   struct stat st;
+@@ -455,7 +456,7 @@ xdg_mime_init (void)
+       icon_list = _xdg_mime_icon_list_new ();
+       generic_icon_list = _xdg_mime_icon_list_new ();
+ 
+-      xdg_run_command_on_dirs ((XdgDirectoryFunc) xdg_mime_init_from_directory,
++      xdg_run_command_on_dirs (xdg_mime_init_from_directory,
+ 			       NULL);
+ 
+       need_reread = FALSE;
+diff --git a/Source/WebCore/platform/network/soup/WebKitAutoconfigProxyResolver.cpp b/Source/WebCore/platform/network/soup/WebKitAutoconfigProxyResolver.cpp
+index 752f5103..4dd20cf6 100644
+--- a/Source/WebCore/platform/network/soup/WebKitAutoconfigProxyResolver.cpp
++++ b/Source/WebCore/platform/network/soup/WebKitAutoconfigProxyResolver.cpp
+@@ -34,7 +34,7 @@ struct _WebKitAutoconfigProxyResolverPrivate {
+     CString autoconfigURL;
+ };
+ 
+-static void webkitAutoconfigProxyResolverInterfaceInit(GProxyResolverInterface*);
++static void webkitAutoconfigProxyResolverInterfaceInit(GProxyResolverInterface*, gpointer);
+ 
+ WEBKIT_DEFINE_TYPE_WITH_CODE(WebKitAutoconfigProxyResolver, webkit_autoconfig_proxy_resolver, G_TYPE_OBJECT,
+     G_IMPLEMENT_INTERFACE(G_TYPE_PROXY_RESOLVER, webkitAutoconfigProxyResolverInterfaceInit))
+@@ -97,7 +97,7 @@ static gchar** webkitAutoconfigProxyResolverLookupFinish(GProxyResolver*, GAsync
+     return static_cast<char**>(g_task_propagate_pointer(G_TASK(result), error));
+ }
+ 
+-static void webkitAutoconfigProxyResolverInterfaceInit(GProxyResolverInterface* interface)
++static void webkitAutoconfigProxyResolverInterfaceInit(GProxyResolverInterface* interface, gpointer)
+ {
+     interface->lookup = webkitAutoconfigProxyResolverLookup;
+     interface->lookup_async = webkitAutoconfigProxyResolverLookupAsync;
+diff --git a/Source/WebCore/platform/network/soup/WebKitFormDataInputStream.cpp b/Source/WebCore/platform/network/soup/WebKitFormDataInputStream.cpp
+index 5449f888..406af837 100644
+--- a/Source/WebCore/platform/network/soup/WebKitFormDataInputStream.cpp
++++ b/Source/WebCore/platform/network/soup/WebKitFormDataInputStream.cpp
+@@ -40,7 +40,7 @@ struct _WebKitFormDataInputStreamPrivate {
+     bool canPoll;
+ };
+ 
+-static void webkitFormDataInputStreamPollableInterfaceInit(GPollableInputStreamInterface*);
++static void webkitFormDataInputStreamPollableInterfaceInit(GPollableInputStreamInterface*, gpointer);
+ 
+ WEBKIT_DEFINE_TYPE_WITH_CODE(WebKitFormDataInputStream, webkit_form_data_input_stream, G_TYPE_INPUT_STREAM,
+     G_IMPLEMENT_INTERFACE(G_TYPE_POLLABLE_INPUT_STREAM, webkitFormDataInputStreamPollableInterfaceInit))
+@@ -177,7 +177,7 @@ static GSource* webkitFormDataInputStreamCreateSource(GPollableInputStream* stre
+     return g_pollable_source_new_full(stream, base.get(), cancellable);
+ }
+ 
+-static void webkitFormDataInputStreamPollableInterfaceInit(GPollableInputStreamInterface* iface)
++static void webkitFormDataInputStreamPollableInterfaceInit(GPollableInputStreamInterface* iface, gpointer)
+ {
+     iface->can_poll = webkitFormDataInputStreamCanPoll;
+     iface->is_readable = webkitFormDataInputStreamIsReadable;
+diff --git a/Source/WebKit/Shared/glib/WebKitContextMenuGAction.cpp b/Source/WebKit/Shared/glib/WebKitContextMenuGAction.cpp
+index 04434889..cf327791 100644
+--- a/Source/WebKit/Shared/glib/WebKitContextMenuGAction.cpp
++++ b/Source/WebKit/Shared/glib/WebKitContextMenuGAction.cpp
+@@ -30,7 +30,7 @@
+ 
+ using namespace WebKit;
+ 
+-static void webkitContextMenuGActionGActionInterfaceInit(GActionInterface*);
++static void webkitContextMenuGActionGActionInterfaceInit(GActionInterface*, gpointer);
+ 
+ struct _WebKitContextMenuGActionPrivate {
+     GUniquePtr<char> name;
+@@ -130,7 +130,7 @@ ALLOW_DEPRECATED_DECLARATIONS_END
+     page->contextMenuItemSelected(priv->item, proxy->frameInfo());
+ }
+ 
+-static void webkitContextMenuGActionGActionInterfaceInit(GActionInterface* iface)
++static void webkitContextMenuGActionGActionInterfaceInit(GActionInterface* iface, gpointer)
+ {
+     iface->get_name = webkitContextMenuGActionGetName;
+     iface->get_parameter_type = webkitContextMenuGActionGetParameterType;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitClipboardPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitClipboardPermissionRequest.cpp
+index e9f6ba34..4355ebf1 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitClipboardPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitClipboardPermissionRequest.cpp
+@@ -44,7 +44,7 @@ typedef WebKitPermissionRequestIface WebKitPermissionRequestInterface;
+  * Since: 2.42
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitClipboardPermissionRequestPrivate {
+     CompletionHandler<void(WebCore::DOMPasteAccessResponse)> completionHandler;
+@@ -74,7 +74,7 @@ static void webkitClipboardPermissionRequestDeny(WebKitPermissionRequest* reques
+         priv->completionHandler(WebCore::DOMPasteAccessResponse::DeniedForGesture);
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitClipboardPermissionRequestAllow;
+     iface->deny = webkitClipboardPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitDeviceInfoPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitDeviceInfoPermissionRequest.cpp
+index ef0433ef..e04588f6 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitDeviceInfoPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitDeviceInfoPermissionRequest.cpp
+@@ -50,7 +50,7 @@ using namespace WebKit;
+  * Since: 2.24
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitDeviceInfoPermissionRequestPrivate {
+     RefPtr<UserMediaPermissionCheckProxy> request;
+@@ -100,7 +100,7 @@ static void webkitDeviceInfoPermissionRequestDeny(WebKitPermissionRequest* reque
+     priv->request->setUserMediaAccessInfo(false);
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitDeviceInfoPermissionRequestAllow;
+     iface->deny = webkitDeviceInfoPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitGeolocationPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitGeolocationPermissionRequest.cpp
+index 7ed349e4..c7a50831 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitGeolocationPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitGeolocationPermissionRequest.cpp
+@@ -61,7 +61,7 @@ using namespace WebKit;
+  * does not match the name of a valid `.desktop` file.
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitGeolocationPermissionRequestPrivate {
+     RefPtr<GeolocationPermissionRequest> request;
+@@ -100,7 +100,7 @@ static void webkitGeolocationPermissionRequestDeny(WebKitPermissionRequest* requ
+     priv->madeDecision = true;
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitGeolocationPermissionRequestAllow;
+     iface->deny = webkitGeolocationPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitImage.cpp b/Source/WebKit/UIProcess/API/glib/WebKitImage.cpp
+index 7dce12e3..e59c6d12 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitImage.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitImage.cpp
+@@ -43,8 +43,8 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/encode/SkPngEncoder.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+-static void webkit_image_gicon_interface_init(GIconIface*);
+-static void webkit_image_gloadable_icon_interface_init(GLoadableIconIface*);
++static void webkit_image_gicon_interface_init(GIconIface*, gpointer);
++static void webkit_image_gloadable_icon_interface_init(GLoadableIconIface*, gpointer);
+ 
+ struct _WebKitImagePrivate {
+     int width;
+@@ -405,13 +405,13 @@ static GInputStream* webkitImageLoadFinish(GLoadableIcon* icon, GAsyncResult* re
+     return G_INPUT_STREAM(g_task_propagate_pointer(G_TASK(res), error));
+ }
+ 
+-static void webkit_image_gicon_interface_init(GIconIface* iface)
++static void webkit_image_gicon_interface_init(GIconIface* iface, gpointer)
+ {
+     iface->hash = webkitImageHash;
+     iface->equal = webkitImageEqual;
+ }
+ 
+-static void webkit_image_gloadable_icon_interface_init(GLoadableIconIface* iface)
++static void webkit_image_gloadable_icon_interface_init(GLoadableIconIface* iface, gpointer)
+ {
+     iface->load = webkitImageLoad;
+     iface->load_async = webkitImageLoadAsync;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitInstallMissingMediaPluginsPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitInstallMissingMediaPluginsPermissionRequest.cpp
+index 6bac960a..865dbce8 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitInstallMissingMediaPluginsPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitInstallMissingMediaPluginsPermissionRequest.cpp
+@@ -39,7 +39,7 @@
+  * Deprecated: 2.40
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestIface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestIface*, gpointer);
+ 
+ struct _WebKitInstallMissingMediaPluginsPermissionRequestPrivate {
+ };
+@@ -48,7 +48,7 @@ WEBKIT_DEFINE_TYPE_WITH_CODE(
+     WebKitInstallMissingMediaPluginsPermissionRequest, webkit_install_missing_media_plugins_permission_request, G_TYPE_OBJECT,
+     G_IMPLEMENT_INTERFACE(WEBKIT_TYPE_PERMISSION_REQUEST, webkit_permission_request_interface_init))
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestIface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestIface* iface, gpointer)
+ {
+     iface->allow = [](auto*) { };
+     iface->deny = [](auto*) { };
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitMediaKeySystemPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitMediaKeySystemPermissionRequest.cpp
+index 38eb922a..02bf6768 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitMediaKeySystemPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitMediaKeySystemPermissionRequest.cpp
+@@ -48,7 +48,7 @@ using namespace WebKit;
+  * requested CDM, unless it is already present on the host system.
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitMediaKeySystemPermissionRequestPrivate {
+     RefPtr<MediaKeySystemPermissionRequest> request;
+@@ -88,7 +88,7 @@ static void webkitMediaKeySystemPermissionRequestDeny(WebKitPermissionRequest* r
+     priv->madeDecision = true;
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitMediaKeySystemPermissionRequestAllow;
+     iface->deny = webkitMediaKeySystemPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitNotificationPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitNotificationPermissionRequest.cpp
+index 330f1f98..3424e2ef 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitNotificationPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitNotificationPermissionRequest.cpp
+@@ -47,7 +47,7 @@ using namespace WebKit;
+  * Since: 2.8
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitNotificationPermissionRequestPrivate {
+     RefPtr<NotificationPermissionRequest> request;
+@@ -86,7 +86,7 @@ static void webkitNotificationPermissionRequestDeny(WebKitPermissionRequest* req
+     priv->madeDecision = true;
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitNotificationPermissionRequestAllow;
+     iface->deny = webkitNotificationPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitPointerLockPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitPointerLockPermissionRequest.cpp
+index 2196fa7b..c0208492 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitPointerLockPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitPointerLockPermissionRequest.cpp
+@@ -45,7 +45,7 @@
+ typedef WebKitPermissionRequestIface WebKitPermissionRequestInterface;
+ #endif
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitPointerLockPermissionRequestPrivate {
+     GRefPtr<WebKitWebView> webView;
+@@ -84,7 +84,7 @@ static void webkitPointerLockPermissionRequestDeny(WebKitPermissionRequest* requ
+ }
+ #endif // ENABLE(POINTER_LOCK)
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+ #if ENABLE(POINTER_LOCK)
+     iface->allow = webkitPointerLockPermissionRequestAllow;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitUserMediaPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitUserMediaPermissionRequest.cpp
+index a9ffeec6..8eedcf64 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitUserMediaPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitUserMediaPermissionRequest.cpp
+@@ -53,7 +53,7 @@ enum {
+     PROP_IS_FOR_VIDEO_DEVICE
+ };
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitUserMediaPermissionRequestPrivate {
+     RefPtr<UserMediaPermissionRequestProxy> request;
+@@ -99,7 +99,7 @@ static void webkitUserMediaPermissionRequestDeny(WebKitPermissionRequest* reques
+     priv->request->deny(UserMediaPermissionRequestProxy::UserMediaAccessDenialReason::PermissionDenied);
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitUserMediaPermissionRequestAllow;
+     iface->deny = webkitUserMediaPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebExtension.cpp b/Source/WebKit/UIProcess/API/glib/WebKitWebExtension.cpp
+index a3a7f657..16004bf1 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebExtension.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebExtension.cpp
+@@ -49,7 +49,7 @@ using namespace WebKit;
+  * Since: 2.52
+  */
+ 
+-static void gInitableInterfaceInit(GInitableIface*);
++static void gInitableInterfaceInit(GInitableIface*, gpointer);
+ 
+ struct _WebKitWebExtensionPrivate {
+ #if ENABLE(WK_WEB_EXTENSIONS)
+@@ -479,7 +479,7 @@ static gboolean webkitWebExtensionInitableInit(GInitable* initable, GCancellable
+ #endif
+ }
+ 
+-static void gInitableInterfaceInit(GInitableIface* iface)
++static void gInitableInterfaceInit(GInitableIface* iface, gpointer)
+ {
+     iface->init = webkitWebExtensionInitableInit;
+ }
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebsiteDataAccessPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitWebsiteDataAccessPermissionRequest.cpp
+index 3f72b11d..4029f7ff 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebsiteDataAccessPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebsiteDataAccessPermissionRequest.cpp
+@@ -43,7 +43,7 @@ typedef WebKitPermissionRequestIface WebKitPermissionRequestInterface;
+  * Since: 2.30
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitWebsiteDataAccessPermissionRequestPrivate {
+     CString requestingDomain;
+@@ -73,7 +73,7 @@ static void webkitWebsiteDataAccessPermissionRequestDeny(WebKitPermissionRequest
+         priv->completionHandler(false);
+ }
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+     iface->allow = webkitWebsiteDataAccessPermissionRequestAllow;
+     iface->deny = webkitWebsiteDataAccessPermissionRequestDeny;
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitXRPermissionRequest.cpp b/Source/WebKit/UIProcess/API/glib/WebKitXRPermissionRequest.cpp
+index d01d3fbe..cdf2a627 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitXRPermissionRequest.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitXRPermissionRequest.cpp
+@@ -81,7 +81,7 @@ static PlatformXR::Device::FeatureList toFeatureList(WebKitXRSessionFeatures fea
+  * Since: 2.52
+  */
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*);
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface*, gpointer);
+ 
+ struct _WebKitXRPermissionRequestPrivate {
+ #if ENABLE(WEBXR)
+@@ -123,7 +123,7 @@ static void webkitXRPermissionRequestDeny(WebKitPermissionRequest* request)
+ }
+ #endif
+ 
+-static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface)
++static void webkit_permission_request_interface_init(WebKitPermissionRequestInterface* iface, gpointer)
+ {
+ #if ENABLE(WEBXR)
+     iface->allow = webkitXRPermissionRequestAllow;
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEGestureControllerImpl.cpp b/Source/WebKit/WPEPlatform/wpe/WPEGestureControllerImpl.cpp
+index db6a0a01..941e7a4c 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEGestureControllerImpl.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEGestureControllerImpl.cpp
+@@ -33,7 +33,7 @@ struct _WPEGestureControllerImplPrivate {
+     WPE::GestureDetector detector;
+ };
+ 
+-static void wpe_gesture_controller_interface_init(WPEGestureControllerInterface*);
++static void wpe_gesture_controller_interface_init(WPEGestureControllerInterface*, gpointer);
+ 
+ WEBKIT_DEFINE_FINAL_TYPE_WITH_CODE(
+     WPEGestureControllerImpl, wpe_gesture_controller_impl, G_TYPE_OBJECT, GObject,
+@@ -83,7 +83,7 @@ static void wpe_gesture_controller_impl_class_init(WPEGestureControllerImplClass
+ {
+ }
+ 
+-static void wpe_gesture_controller_interface_init(WPEGestureControllerInterface* interface)
++static void wpe_gesture_controller_interface_init(WPEGestureControllerInterface* interface, gpointer)
+ {
+     interface->handle_event = wpeHandleEvent;
+     interface->cancel = wpeCancel;

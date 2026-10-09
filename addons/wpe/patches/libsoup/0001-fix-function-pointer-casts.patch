@@ -1,0 +1,237 @@
+Fix function pointer casts: functions called through pointers of their own type (interface init
+functions with the two parameters GLib calls them with, foreach/sort callbacks, OpenSSL's I/O
+functions): WebAssembly checks the type of every call through a pointer.
+
+diff -ruN libsoup-pristine/libsoup/content-decoder/soup-brotli-decompressor.c libsoup-fixed/libsoup/content-decoder/soup-brotli-decompressor.c
+--- a/libsoup/content-decoder/soup-brotli-decompressor.c	2026-10-03 23:23:22.504159067 +0000
++++ b/libsoup/content-decoder/soup-brotli-decompressor.c	2026-10-03 23:23:22.647757611 +0000
+@@ -43,8 +43,8 @@
+ 	SoupDictionaryHeader header;
+ };
+ 
+-static void soup_brotli_decompressor_iface_init (GConverterIface *iface);
+-static void soup_brotli_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface);
++static void soup_brotli_decompressor_iface_init (GConverterIface *iface, gpointer unused_1);
++static void soup_brotli_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupBrotliDecompressor, soup_brotli_decompressor, G_TYPE_OBJECT,
+                                G_IMPLEMENT_INTERFACE (G_TYPE_CONVERTER, soup_brotli_decompressor_iface_init)
+@@ -220,7 +220,7 @@
+ 	G_OBJECT_CLASS (soup_brotli_decompressor_parent_class)->finalize (object);
+ }
+ 
+-static void soup_brotli_decompressor_iface_init (GConverterIface *iface)
++static void soup_brotli_decompressor_iface_init (GConverterIface *iface, gpointer unused_1)
+ {
+ 	iface->convert = soup_brotli_decompressor_convert;
+ 	iface->reset = soup_brotli_decompressor_reset;
+@@ -243,7 +243,7 @@
+ }
+ 
+ static void
+-soup_brotli_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface)
++soup_brotli_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface, gpointer unused_1)
+ {
+ 	iface->set_dictionary = soup_brotli_decompressor_set_dictionary;
+ }
+diff -ruN libsoup-pristine/libsoup/content-decoder/soup-converter-wrapper.c libsoup-fixed/libsoup/content-decoder/soup-converter-wrapper.c
+--- a/libsoup/content-decoder/soup-converter-wrapper.c	2026-10-03 23:23:22.504159067 +0000
++++ b/libsoup/content-decoder/soup-converter-wrapper.c	2026-10-03 23:23:22.648369927 +0000
+@@ -49,7 +49,7 @@
+ 	gboolean discarding;
+ } SoupConverterWrapperPrivate;
+ 
+-static void soup_converter_wrapper_iface_init (GConverterIface *iface);
++static void soup_converter_wrapper_iface_init (GConverterIface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupConverterWrapper, soup_converter_wrapper, G_TYPE_OBJECT,
+                                G_ADD_PRIVATE (SoupConverterWrapper)
+@@ -343,7 +343,7 @@
+ }
+ 
+ static void
+-soup_converter_wrapper_iface_init (GConverterIface *iface)
++soup_converter_wrapper_iface_init (GConverterIface *iface, gpointer unused_1)
+ {
+ 	iface->convert = soup_converter_wrapper_convert;
+ 	iface->reset = soup_converter_wrapper_reset;
+diff -ruN libsoup-pristine/libsoup/content-decoder/soup-zstd-decompressor.c libsoup-fixed/libsoup/content-decoder/soup-zstd-decompressor.c
+--- a/libsoup/content-decoder/soup-zstd-decompressor.c	2026-10-03 23:23:22.504159067 +0000
++++ b/libsoup/content-decoder/soup-zstd-decompressor.c	2026-10-03 23:23:22.648681479 +0000
+@@ -44,8 +44,8 @@
+ 	SoupDictionaryHeader header;
+ };
+ 
+-static void soup_zstd_decompressor_iface_init (GConverterIface *iface);
+-static void soup_zstd_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface);
++static void soup_zstd_decompressor_iface_init (GConverterIface *iface, gpointer unused_1);
++static void soup_zstd_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupZstdDecompressor, soup_zstd_decompressor, G_TYPE_OBJECT,
+                                G_IMPLEMENT_INTERFACE (G_TYPE_CONVERTER, soup_zstd_decompressor_iface_init)
+@@ -195,7 +195,7 @@
+ 	G_OBJECT_CLASS (soup_zstd_decompressor_parent_class)->finalize (object);
+ }
+ 
+-static void soup_zstd_decompressor_iface_init (GConverterIface *iface)
++static void soup_zstd_decompressor_iface_init (GConverterIface *iface, gpointer unused_1)
+ {
+ 	iface->convert = soup_zstd_decompressor_convert;
+ 	iface->reset = soup_zstd_decompressor_reset;
+@@ -218,7 +218,7 @@
+ }
+ 
+ static void
+-soup_zstd_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface)
++soup_zstd_decompressor_dictionary_decoder_init (SoupCompressionDictionaryDecoderInterface *iface, gpointer unused_1)
+ {
+ 	iface->set_dictionary = soup_zstd_decompressor_set_dictionary;
+ }
+diff -ruN libsoup-pristine/libsoup/cookies/soup-cookie-jar-db.c libsoup-fixed/libsoup/cookies/soup-cookie-jar-db.c
+--- a/libsoup/cookies/soup-cookie-jar-db.c	2026-10-03 23:23:22.505242413 +0000
++++ b/libsoup/cookies/soup-cookie-jar-db.c	2026-10-03 23:23:22.646206622 +0000
+@@ -60,7 +60,7 @@
+ 	GError *init_error;
+ } SoupCookieJarDBPrivate;
+ 
+-static void soup_cookie_jar_db_initable_iface_init (GInitableIface *iface);
++static void soup_cookie_jar_db_initable_iface_init (GInitableIface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupCookieJarDB, soup_cookie_jar_db, SOUP_TYPE_COOKIE_JAR,
+ 			       G_ADD_PRIVATE (SoupCookieJarDB)
+@@ -537,7 +537,7 @@
+ }
+ 
+ static void
+-soup_cookie_jar_db_initable_iface_init (GInitableIface *iface)
++soup_cookie_jar_db_initable_iface_init (GInitableIface *iface, gpointer unused_1)
+ {
+ 	iface->init = soup_cookie_jar_db_initable_init;
+ }
+diff -ruN libsoup-pristine/libsoup/http1/soup-body-input-stream.c libsoup-fixed/libsoup/http1/soup-body-input-stream.c
+--- a/libsoup/http1/soup-body-input-stream.c	2026-10-03 23:23:22.506325758 +0000
++++ b/libsoup/http1/soup-body-input-stream.c	2026-10-03 23:23:22.645440606 +0000
+@@ -59,7 +59,7 @@
+ static GParamSpec *properties[LAST_PROPERTY] = { NULL, };
+ 
+ static void soup_body_input_stream_pollable_init (GPollableInputStreamInterface *pollable_interface, gpointer interface_data);
+-static void soup_body_input_stream_seekable_init (GSeekableIface *seekable_interface);
++static void soup_body_input_stream_seekable_init (GSeekableIface *seekable_interface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupBodyInputStream, soup_body_input_stream, G_TYPE_FILTER_INPUT_STREAM,
+                                G_ADD_PRIVATE (SoupBodyInputStream)
+@@ -571,7 +571,7 @@
+ }
+ 
+ static void
+-soup_body_input_stream_seekable_init (GSeekableIface *seekable_interface)
++soup_body_input_stream_seekable_init (GSeekableIface *seekable_interface, gpointer unused_1)
+ {
+ 	seekable_interface->tell         = soup_body_input_stream_tell;
+ 	seekable_interface->can_seek     = soup_body_input_stream_can_seek;
+diff -ruN libsoup-pristine/libsoup/http2/soup-body-input-stream-http2.c libsoup-fixed/libsoup/http2/soup-body-input-stream-http2.c
+--- a/libsoup/http2/soup-body-input-stream-http2.c	2026-10-03 23:23:22.507409103 +0000
++++ b/libsoup/http2/soup-body-input-stream-http2.c	2026-10-03 23:23:22.644922045 +0000
+@@ -50,7 +50,7 @@
+         GCancellable *need_more_data_cancellable;
+ } SoupBodyInputStreamHttp2Private;
+ 
+-static void soup_body_input_stream_http2_pollable_iface_init (GPollableInputStreamInterface *iface);
++static void soup_body_input_stream_http2_pollable_iface_init (GPollableInputStreamInterface *iface, gpointer unused_1);
+ 
+ G_DEFINE_FINAL_TYPE_WITH_CODE (SoupBodyInputStreamHttp2, soup_body_input_stream_http2, G_TYPE_INPUT_STREAM,
+                                G_ADD_PRIVATE (SoupBodyInputStreamHttp2)
+@@ -419,7 +419,7 @@
+ }
+ 
+ static void
+-soup_body_input_stream_http2_pollable_iface_init (GPollableInputStreamInterface *iface)
++soup_body_input_stream_http2_pollable_iface_init (GPollableInputStreamInterface *iface, gpointer unused_1)
+ {
+         iface->is_readable = soup_body_input_stream_http2_is_readable;
+         iface->create_source = soup_body_input_stream_http2_create_source;
+diff -ruN libsoup-pristine/libsoup/http2/soup-client-message-io-http2.c libsoup-fixed/libsoup/http2/soup-client-message-io-http2.c
+--- a/libsoup/http2/soup-client-message-io-http2.c	2026-10-03 23:23:22.507409103 +0000
++++ b/libsoup/http2/soup-client-message-io-http2.c	2026-10-03 23:36:18.225553150 +0000
+@@ -520,9 +520,8 @@
+ 
+         if (error) {
+                 set_io_error (io, error);
+-                g_list_foreach (io->pending_io_messages,
+-                                (GFunc)soup_http2_message_data_check_status,
+-                                NULL);
++                for (GList *l = io->pending_io_messages; l; l = l->next)
++                        soup_http2_message_data_check_status (l->data);
+         }
+ 
+         g_clear_pointer (&io->read_source, g_source_unref);
+diff -ruN libsoup-pristine/libsoup/soup-headers.c libsoup-fixed/libsoup/soup-headers.c
+--- a/libsoup/soup-headers.c	2026-10-03 23:23:22.509575794 +0000
++++ b/libsoup/soup-headers.c	2026-10-03 23:36:18.225492257 +0000
+@@ -798,7 +798,8 @@
+ 
+ 		if (strict && duplicated) {
+ 			g_clear_pointer (&params, soup_header_free_param_list);
+-			g_slist_foreach (iter, (GFunc)g_free, NULL);
++			for (GSList *l = iter; l; l = l->next)
++				g_free (l->data);
+ 			if (parsed_value)
+ 				g_string_free (parsed_value, TRUE);
+ 			break;
+diff -ruN libsoup-pristine/libsoup/soup-session.c libsoup-fixed/libsoup/soup-session.c
+--- a/libsoup/soup-session.c	2026-10-03 23:23:22.512825830 +0000
++++ b/libsoup/soup-session.c	2026-10-03 23:36:18.225443913 +0000
+@@ -319,7 +319,8 @@
+ 
+ static void
+ destroy_queue_source (gpointer key,
+-                      GSource *source)
++                      GSource *source,
++                      gpointer user_data)
+ {
+         g_source_destroy (source);
+ }
+@@ -1354,7 +1355,8 @@
+ 
+ static int
+ compare_queue_item (SoupMessageQueueItem *a,
+-		    SoupMessageQueueItem *b)
++		    SoupMessageQueueItem *b,
++		    gpointer              user_data)
+ {
+         SoupMessagePriority a_priority = soup_message_get_priority (a->msg);
+         SoupMessagePriority b_priority = soup_message_get_priority (b->msg);
+@@ -2008,7 +2010,8 @@
+ 
+ static void
+ kick_queue_source (gpointer key,
+-                   GSource *source)
++                   GSource *source,
++                   gpointer user_data)
+ {
+         g_source_set_ready_time (source, 0);
+ }
+@@ -2072,6 +2075,14 @@
+ 		soup_message_queue_item_cancel (item);
+ }
+ 
++/* a GFunc for g_queue_foreach (called with two arguments: on WebAssembly the types must agree) */
++static void
++cancel_queue_item (gpointer item,
++                   gpointer user_data)
++{
++        soup_message_queue_item_cancel (item);
++}
++
+ /**
+  * soup_session_abort:
+  * @session: the session
+@@ -2090,7 +2101,7 @@
+ 
+ 	/* Cancel everything */
+         g_mutex_lock (&priv->queue_mutex);
+-	g_queue_foreach (priv->queue, (GFunc)soup_message_queue_item_cancel, NULL);
++	g_queue_foreach (priv->queue, cancel_queue_item, NULL);
+         g_mutex_unlock (&priv->queue_mutex);
+ 
+ 	/* Close all idle connections */

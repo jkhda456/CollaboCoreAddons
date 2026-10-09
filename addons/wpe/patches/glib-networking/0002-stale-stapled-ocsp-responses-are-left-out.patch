@@ -1,0 +1,30 @@
+Leave out a stapled OCSP response outside its validity period instead of failing the connection,
+as browsers do (a sandbox whose clock is days off failed on most sites that staple one); a
+response that says revoked, or a Must-Staple certificate, still fails.
+
+diff -ruN glib-networking-fixed/tls/openssl/gtlsdatabase-openssl.c glib-networking-fixed2/tls/openssl/gtlsdatabase-openssl.c
+--- a/tls/openssl/gtlsdatabase-openssl.c	2026-10-03 23:23:22.712554703 +0000
++++ b/tls/openssl/gtlsdatabase-openssl.c	2026-10-04 01:23:49.476858841 +0000
+@@ -577,8 +577,20 @@
+                                 300L,
+                                 -1L))
+         {
+-          errors = G_TLS_CERTIFICATE_GENERIC_ERROR;
+-          goto end;
++          /* A response outside its validity period says nothing about now (the clock may be
++           * off by days, the server may staple a stale one): it is left out, as browsers do,
++           * unless it says revoked or the certificate demands a response (Must-Staple). */
++          if (cert_status == V_OCSP_CERTSTATUS_REVOKED)
++            {
++              errors = G_TLS_CERTIFICATE_REVOKED;
++              goto end;
++            }
++          if (check_for_ocsp_must_staple (sk_X509_value (chain_openssl, 0)))
++            {
++              errors = G_TLS_CERTIFICATE_GENERIC_ERROR;
++              goto end;
++            }
++          continue;
+         }
+ 
+       switch (cert_status)

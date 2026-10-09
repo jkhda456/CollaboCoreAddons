@@ -1,0 +1,32 @@
+# The file types the browser tells by name (xdgmime: weight:type:glob), for pages and files opened
+# from the sandbox's disk (file://) and downloads: the guest has no shared-mime-info database.
+# Written for the wpe add-on; the common types of the web only.
+50:text/html:*.html
+50:text/html:*.htm
+50:application/xhtml+xml:*.xhtml
+50:text/css:*.css
+50:text/javascript:*.js
+50:text/javascript:*.mjs
+50:application/json:*.json
+50:application/xml:*.xml
+50:image/svg+xml:*.svg
+50:text/plain:*.txt
+50:text/plain:*.log
+50:text/markdown:*.md
+50:text/csv:*.csv
+50:image/png:*.png
+50:image/jpeg:*.jpg
+50:image/jpeg:*.jpeg
+50:image/gif:*.gif
+50:image/webp:*.webp
+50:image/x-icon:*.ico
+50:image/bmp:*.bmp
+50:font/woff:*.woff
+50:font/woff2:*.woff2
+50:font/ttf:*.ttf
+50:font/otf:*.otf
+50:application/pdf:*.pdf
+50:application/zip:*.zip
+50:application/gzip:*.gz
+50:application/wasm:*.wasm
+50:application/octet-stream:*.bin

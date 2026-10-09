@@ -1,0 +1,1454 @@
+diff --git a/Source/WebKit/PlatformWPE.cmake b/Source/WebKit/PlatformWPE.cmake
+index 7ca61370..babab59e 100644
+--- a/Source/WebKit/PlatformWPE.cmake
++++ b/Source/WebKit/PlatformWPE.cmake
+@@ -546,6 +546,13 @@ if (ENABLE_WPE_PLATFORM)
+         endif ()
+     endif ()
+ 
++    if (ENABLE_WPE_PLATFORM_COLLABO)
++        list(APPEND WebKit_PRIVATE_LIBRARIES WPEPlatformCollabo)
++        if (_old_cmake_swift_needs_explicit_objects)
++            list(APPEND WebKit_PRIVATE_LIBRARIES "$<TARGET_OBJECTS:WPEPlatformCollabo>")
++        endif ()
++    endif ()
++
+     if (ENABLE_WPE_PLATFORM_HEADLESS)
+         list(APPEND WebKit_PRIVATE_LIBRARIES WPEPlatformHeadless)
+         if (_old_cmake_swift_needs_explicit_objects)
+diff --git a/Source/WebKit/WPEPlatform/CMakeLists.txt b/Source/WebKit/WPEPlatform/CMakeLists.txt
+index d996a7ba..873dae64 100644
+--- a/Source/WebKit/WPEPlatform/CMakeLists.txt
++++ b/Source/WebKit/WPEPlatform/CMakeLists.txt
+@@ -161,6 +161,10 @@ if (ENABLE_WPE_PLATFORM_DRM)
+     list(APPEND WPEPlatform_LIBRARIES WPEPlatformDRM)
+ endif ()
+ 
++if (ENABLE_WPE_PLATFORM_COLLABO)
++    add_subdirectory(${WEBKIT_DIR}/WPEPlatform/wpe/collabo)
++endif ()
++
+ if (ENABLE_WPE_PLATFORM_HEADLESS)
+     add_subdirectory(${WEBKIT_DIR}/WPEPlatform/wpe/headless)
+     list(APPEND WPEPlatform_LIBRARIES WPEPlatformHeadless)
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+index bd355a0c..42826874 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+@@ -39,6 +39,10 @@
+ #include "wpe/headless/WPEDisplayHeadless.h"
+ #endif
+ 
++#if ENABLE(WPE_PLATFORM_COLLABO)
++#include "wpe/collabo/WPEDisplayCollabo.h"
++#endif
++
+ #if ENABLE(WPE_PLATFORM_WAYLAND)
+ #include "wpe/wayland/WPEDisplayWayland.h"
+ #endif
+@@ -76,6 +80,9 @@ void wpeEnsureExtensionPointsLoaded()
+ #if ENABLE(WPE_PLATFORM_HEADLESS)
+         g_type_ensure(wpe_display_headless_get_type());
+ #endif
++#if ENABLE(WPE_PLATFORM_COLLABO)
++        g_type_ensure(wpe_display_collabo_get_type());
++#endif
+ #if ENABLE(WPE_PLATFORM_WAYLAND)
+         g_type_ensure(wpe_display_wayland_get_type());
+ #endif
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/CMakeLists.txt b/Source/WebKit/WPEPlatform/wpe/collabo/CMakeLists.txt
+new file mode 100644
+index 00000000..3b419ba8
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/CMakeLists.txt
+@@ -0,0 +1,38 @@
++# The collaboCore display backend. Its client library (collabo_gui.c, MIT) is collaboCore's own,
++# from COLLABO_GUI_CLIENT_DIR (tools/gui/client in the collaboCore tree).
++set(COLLABO_GUI_CLIENT_DIR "" CACHE PATH "collaboCore's GUI client library (tools/gui/client)")
++if (NOT EXISTS "${COLLABO_GUI_CLIENT_DIR}/collabo_gui.c")
++    message(FATAL_ERROR "ENABLE_WPE_PLATFORM_COLLABO needs COLLABO_GUI_CLIENT_DIR (collaboCore's tools/gui/client)")
++endif ()
++
++set(WPEPlatformCollabo_SOURCES
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/WPEDisplayCollabo.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/WPEToplevelCollabo.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/WPEViewCollabo.cpp
++    ${COLLABO_GUI_CLIENT_DIR}/collabo_gui.c
++)
++
++set(WPEPlatformCollabo_INSTALLED_HEADERS
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/wpe-collabo.h
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/WPEDisplayCollabo.h
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/WPEToplevelCollabo.h
++    ${WEBKIT_DIR}/WPEPlatform/wpe/collabo/WPEViewCollabo.h
++)
++
++set(WPEPlatformCollabo_PRIVATE_INCLUDE_DIRECTORIES
++    "${WPEPlatform_PRIVATE_INCLUDE_DIRECTORIES}"
++    "${WEBKIT_DIR}/WPEPlatform/wpe/collabo"
++    "${COLLABO_GUI_CLIENT_DIR}"
++)
++
++add_library(WPEPlatformCollabo OBJECT ${WPEPlatformCollabo_SOURCES})
++target_compile_options(WPEPlatformCollabo PRIVATE ${DEVELOPER_MODE_CXX_FLAGS})
++target_include_directories(WPEPlatformCollabo PRIVATE ${WPEPlatformCollabo_PRIVATE_INCLUDE_DIRECTORIES})
++target_include_directories(WPEPlatformCollabo SYSTEM PRIVATE ${WPEPlatform_SYSTEM_INCLUDE_DIRECTORIES})
++target_link_libraries(WPEPlatformCollabo ${WPEPlatform_LIBRARIES})
++add_dependencies(WPEPlatformCollabo WPEPlatformGeneratedEnumTypesHeader)
++
++install(FILES ${WPEPlatformCollabo_INSTALLED_HEADERS}
++        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/wpe-webkit-${WPE_API_VERSION}/wpe-platform/wpe/collabo"
++        COMPONENT "Development"
++)
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPECollaboPrivate.h b/Source/WebKit/WPEPlatform/wpe/collabo/WPECollaboPrivate.h
+new file mode 100644
+index 00000000..36a0351d
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPECollaboPrivate.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#pragma once
++
++// What the collabo backend's display, toplevels and views share (not installed).
++
++#include "WPEDisplayCollabo.h"
++#include "WPEToplevelCollabo.h"
++#include "WPEViewCollabo.h"
++#include <collabo_gui.h>
++
++// The display's connection to the guest's display server (tools/gui), for one thread: the main one.
++cg_display* wpeDisplayCollaboGetConnection(WPEDisplayCollabo*);
++void wpeDisplayCollaboAddToplevel(WPEDisplayCollabo*, uint32_t canvas, WPEToplevelCollabo*);
++void wpeDisplayCollaboRemoveToplevel(WPEDisplayCollabo*, uint32_t canvas);
++
++uint32_t wpeToplevelCollaboGetCanvas(WPEToplevelCollabo*);
++// The server gave the canvas a new size.
++void wpeToplevelCollaboConfigure(WPEToplevelCollabo*, uint32_t width, uint32_t height);
++// The view the toplevel shows (one per toplevel), or null.
++WPEView* wpeToplevelCollaboGetView(WPEToplevelCollabo*);
++
++// The commit `serial` is on the canvas.
++void wpeViewCollaboFrameDone(WPEViewCollabo*, uint32_t serial);
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPEDisplayCollabo.cpp b/Source/WebKit/WPEPlatform/wpe/collabo/WPEDisplayCollabo.cpp
+new file mode 100644
+index 00000000..d6ce2e86
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPEDisplayCollabo.cpp
+@@ -0,0 +1,769 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "WPEDisplayCollabo.h"
++
++#include "WPECollaboPrivate.h"
++#include "WPEExtensions.h"
++#include <wtf/Deque.h>
++#include <wtf/HashMap.h>
++#include <wtf/Vector.h>
++#include <wtf/glib/GRefPtr.h>
++#include <wtf/glib/GUniquePtr.h>
++#include <wtf/glib/RunLoopSourcePriority.h>
++#include <wtf/glib/WTFGType.h>
++#include <wtf/text/CString.h>
++
++/**
++ * WPEDisplayCollabo:
++ *
++ * A [class@WPEPlatform.Display] for collaboCore's guest display server (`gui`, tools/gui in the
++ * collaboCore tree): each toplevel is a canvas there, the pixels of each frame go to it through
++ * the server's socket (the guest has no shared memory between processes), and its input (pointer,
++ * keyboard, input method, clipboard) comes back as events. Rendering is on the CPU: buffers are
++ * shared memory.
++ *
++ * It is picked by default when a display server can be reached ($COLLABO_GUI_SOCKET,
++ * $COLLABO_GUI_DIR/socket or /tmp/.collabo-gui/socket; the client library starts one if there is
++ * none), or with WPE_PLATFORM=collabo.
++ */
++
++// ── the keymap: a US layout, enough for what WebKit asks (modifiers, keyval of a key) ─────────
++struct CollaboKey {
++    uint16_t code; // Linux evdev
++    uint32_t lower, upper;
++};
++static const CollaboKey s_keys[] = {
++    { 1, 0xff1b, 0xff1b }, { 2, '1', '!' }, { 3, '2', '@' }, { 4, '3', '#' }, { 5, '4', '$' },
++    { 6, '5', '%' }, { 7, '6', '^' }, { 8, '7', '&' }, { 9, '8', '*' }, { 10, '9', '(' },
++    { 11, '0', ')' }, { 12, '-', '_' }, { 13, '=', '+' }, { 14, 0xff08, 0xff08 }, { 15, 0xff09, 0xfe20 },
++    { 16, 'q', 'Q' }, { 17, 'w', 'W' }, { 18, 'e', 'E' }, { 19, 'r', 'R' }, { 20, 't', 'T' },
++    { 21, 'y', 'Y' }, { 22, 'u', 'U' }, { 23, 'i', 'I' }, { 24, 'o', 'O' }, { 25, 'p', 'P' },
++    { 26, '[', '{' }, { 27, ']', '}' }, { 28, 0xff0d, 0xff0d }, { 29, 0xffe3, 0xffe3 },
++    { 30, 'a', 'A' }, { 31, 's', 'S' }, { 32, 'd', 'D' }, { 33, 'f', 'F' }, { 34, 'g', 'G' },
++    { 35, 'h', 'H' }, { 36, 'j', 'J' }, { 37, 'k', 'K' }, { 38, 'l', 'L' }, { 39, ';', ':' },
++    { 40, '\'', '"' }, { 41, '`', '~' }, { 42, 0xffe1, 0xffe1 }, { 43, '\\', '|' },
++    { 44, 'z', 'Z' }, { 45, 'x', 'X' }, { 46, 'c', 'C' }, { 47, 'v', 'V' }, { 48, 'b', 'B' },
++    { 49, 'n', 'N' }, { 50, 'm', 'M' }, { 51, ',', '<' }, { 52, '.', '>' }, { 53, '/', '?' },
++    { 54, 0xffe2, 0xffe2 }, { 56, 0xffe9, 0xffe9 }, { 57, ' ', ' ' }, { 58, 0xffe5, 0xffe5 },
++    { 59, 0xffbe, 0xffbe }, { 60, 0xffbf, 0xffbf }, { 61, 0xffc0, 0xffc0 }, { 62, 0xffc1, 0xffc1 },
++    { 63, 0xffc2, 0xffc2 }, { 64, 0xffc3, 0xffc3 }, { 65, 0xffc4, 0xffc4 }, { 66, 0xffc5, 0xffc5 },
++    { 67, 0xffc6, 0xffc6 }, { 68, 0xffc7, 0xffc7 }, { 87, 0xffc8, 0xffc8 }, { 88, 0xffc9, 0xffc9 },
++    { 97, 0xffe4, 0xffe4 }, { 100, 0xffea, 0xffea }, { 102, 0xff50, 0xff50 }, { 103, 0xff52, 0xff52 },
++    { 104, 0xff55, 0xff55 }, { 105, 0xff51, 0xff51 }, { 106, 0xff53, 0xff53 }, { 107, 0xff57, 0xff57 },
++    { 108, 0xff54, 0xff54 }, { 109, 0xff56, 0xff56 }, { 110, 0xff63, 0xff63 }, { 111, 0xffff, 0xffff },
++    { 125, 0xffeb, 0xffeb }, { 126, 0xffec, 0xffec }, { 127, 0xff67, 0xff67 },
++};
++
++static const CollaboKey* keyForCode(unsigned code)
++{
++    for (const auto& key : s_keys) {
++        if (key.code == code)
++            return &key;
++    }
++    return nullptr;
++}
++
++#define WPE_TYPE_KEYMAP_COLLABO (wpe_keymap_collabo_get_type())
++G_DECLARE_FINAL_TYPE(WPEKeymapCollabo, wpe_keymap_collabo, WPE, KEYMAP_COLLABO, WPEKeymap)
++struct _WPEKeymapCollabo {
++    WPEKeymap parent;
++    WPEModifiers modifiers;
++};
++G_DEFINE_FINAL_TYPE(WPEKeymapCollabo, wpe_keymap_collabo, WPE_TYPE_KEYMAP)
++
++static gboolean wpeKeymapCollaboGetEntriesForKeyval(WPEKeymap*, guint keyval, WPEKeymapEntry** entries, guint* entriesCount)
++{
++    for (const auto& key : s_keys) {
++        if (key.lower == keyval || key.upper == keyval) {
++            *entries = static_cast<WPEKeymapEntry*>(g_malloc(sizeof(WPEKeymapEntry)));
++            (*entries)->keycode = key.code + 8;
++            (*entries)->group = 0;
++            (*entries)->level = key.lower == keyval ? 0 : 1;
++            *entriesCount = 1;
++            return TRUE;
++        }
++    }
++    *entries = nullptr;
++    *entriesCount = 0;
++    return FALSE;
++}
++
++static gboolean wpeKeymapCollaboTranslateKeyboardState(WPEKeymap*, guint keycode, WPEModifiers modifiers, int, guint* keyval, int* effectiveGroup, int* level, WPEModifiers* consumedModifiers)
++{
++    const auto* key = keycode >= 8 ? keyForCode(keycode - 8) : nullptr;
++    if (!key)
++        return FALSE;
++    bool shift = modifiers & WPE_MODIFIER_KEYBOARD_SHIFT;
++    bool isLetter = key->lower >= 'a' && key->lower <= 'z';
++    if (isLetter && (modifiers & WPE_MODIFIER_KEYBOARD_CAPS_LOCK))
++        shift = !shift;
++    if (keyval)
++        *keyval = shift ? key->upper : key->lower;
++    if (effectiveGroup)
++        *effectiveGroup = 0;
++    if (level)
++        *level = shift ? 1 : 0;
++    if (consumedModifiers)
++        *consumedModifiers = static_cast<WPEModifiers>(key->lower != key->upper ? (modifiers & (WPE_MODIFIER_KEYBOARD_SHIFT | WPE_MODIFIER_KEYBOARD_CAPS_LOCK)) : 0);
++    return TRUE;
++}
++
++static WPEModifiers wpeKeymapCollaboGetModifiers(WPEKeymap* keymap)
++{
++    return WPE_KEYMAP_COLLABO(keymap)->modifiers;
++}
++
++static void wpe_keymap_collabo_class_init(WPEKeymapCollaboClass* klass)
++{
++    WPEKeymapClass* keymapClass = WPE_KEYMAP_CLASS(klass);
++    keymapClass->get_entries_for_keyval = wpeKeymapCollaboGetEntriesForKeyval;
++    keymapClass->translate_keyboard_state = wpeKeymapCollaboTranslateKeyboardState;
++    keymapClass->get_modifiers = wpeKeymapCollaboGetModifiers;
++}
++
++static void wpe_keymap_collabo_init(WPEKeymapCollabo*)
++{
++}
++
++// ── the input method: the server's PREEDIT and TEXT events, the caret for `gui info` ─────────
++#define WPE_TYPE_INPUT_METHOD_CONTEXT_COLLABO (wpe_input_method_context_collabo_get_type())
++G_DECLARE_FINAL_TYPE(WPEInputMethodContextCollabo, wpe_input_method_context_collabo, WPE, INPUT_METHOD_CONTEXT_COLLABO, WPEInputMethodContext)
++struct _WPEInputMethodContextCollabo {
++    WPEInputMethodContext parent;
++    CString* preedit;
++    int cursorBegin;
++    int x, y, width, height;
++    bool focused;
++};
++G_DEFINE_FINAL_TYPE(WPEInputMethodContextCollabo, wpe_input_method_context_collabo, WPE_TYPE_INPUT_METHOD_CONTEXT)
++
++static uint32_t canvasOfView(WPEView* view)
++{
++    if (!view)
++        return 0;
++    auto* toplevel = wpe_view_get_toplevel(view);
++    return toplevel && WPE_IS_TOPLEVEL_COLLABO(toplevel) ? wpeToplevelCollaboGetCanvas(WPE_TOPLEVEL_COLLABO(toplevel)) : 0;
++}
++
++static void imContextSendTextInput(WPEInputMethodContextCollabo* context)
++{
++    auto* view = wpe_input_method_context_get_view(WPE_INPUT_METHOD_CONTEXT(context));
++    auto canvas = canvasOfView(view);
++    auto* display = view ? wpe_view_get_display(view) : nullptr;
++    if (!canvas || !display || !WPE_IS_DISPLAY_COLLABO(display))
++        return;
++    if (auto* gui = wpeDisplayCollaboGetConnection(WPE_DISPLAY_COLLABO(display)))
++        cg_text_input(gui, canvas, context->focused, context->x, context->y, std::max(context->width, 0), std::max(context->height, 0));
++}
++
++static void wpeInputMethodContextCollaboGetPreeditString(WPEInputMethodContext* context, gchar** text, GList** underlines, guint* cursorOffset)
++{
++    auto* self = WPE_INPUT_METHOD_CONTEXT_COLLABO(context);
++    const char* preedit = self->preedit->data() ? self->preedit->data() : "";
++    if (text)
++        *text = g_strdup(preedit);
++    if (underlines) {
++        *underlines = nullptr;
++        if (*preedit)
++            *underlines = g_list_prepend(nullptr, wpe_input_method_underline_new(0, g_utf8_strlen(preedit, -1)));
++    }
++    if (cursorOffset) {
++        int bytes = self->cursorBegin < 0 ? static_cast<int>(strlen(preedit)) : std::min<int>(self->cursorBegin, strlen(preedit));
++        *cursorOffset = g_utf8_strlen(preedit, bytes);
++    }
++}
++
++static gboolean wpeInputMethodContextCollaboFilterKeyEvent(WPEInputMethodContext*, WPEEvent*)
++{
++    // the server composes (gui type --ime); a key is never part of a composition here
++    return FALSE;
++}
++
++static void wpeInputMethodContextCollaboFocusIn(WPEInputMethodContext* context)
++{
++    auto* self = WPE_INPUT_METHOD_CONTEXT_COLLABO(context);
++    self->focused = true;
++    imContextSendTextInput(self);
++}
++
++static void wpeInputMethodContextCollaboFocusOut(WPEInputMethodContext* context)
++{
++    auto* self = WPE_INPUT_METHOD_CONTEXT_COLLABO(context);
++    self->focused = false;
++    imContextSendTextInput(self);
++}
++
++static void wpeInputMethodContextCollaboSetCursorArea(WPEInputMethodContext* context, int x, int y, int width, int height)
++{
++    auto* self = WPE_INPUT_METHOD_CONTEXT_COLLABO(context);
++    self->x = x;
++    self->y = y;
++    self->width = width;
++    self->height = height;
++    if (self->focused)
++        imContextSendTextInput(self);
++}
++
++static void imContextSetPreedit(WPEInputMethodContextCollabo* self, const char* text, int cursorBegin)
++{
++    bool wasComposing = self->preedit->length();
++    bool composing = text && *text;
++    if (!wasComposing && !composing)
++        return;
++    *self->preedit = CString(composing ? text : "");
++    self->cursorBegin = cursorBegin;
++    if (!wasComposing)
++        g_signal_emit_by_name(self, "preedit-started");
++    g_signal_emit_by_name(self, "preedit-changed");
++    if (!composing)
++        g_signal_emit_by_name(self, "preedit-finished");
++}
++
++static void wpeInputMethodContextCollaboReset(WPEInputMethodContext* context)
++{
++    imContextSetPreedit(WPE_INPUT_METHOD_CONTEXT_COLLABO(context), nullptr, -1);
++}
++
++static void wpeInputMethodContextCollaboFinalize(GObject* object)
++{
++    delete WPE_INPUT_METHOD_CONTEXT_COLLABO(object)->preedit;
++    G_OBJECT_CLASS(wpe_input_method_context_collabo_parent_class)->finalize(object);
++}
++
++static void wpe_input_method_context_collabo_class_init(WPEInputMethodContextCollaboClass* klass)
++{
++    G_OBJECT_CLASS(klass)->finalize = wpeInputMethodContextCollaboFinalize;
++    WPEInputMethodContextClass* contextClass = WPE_INPUT_METHOD_CONTEXT_CLASS(klass);
++    contextClass->get_preedit_string = wpeInputMethodContextCollaboGetPreeditString;
++    contextClass->filter_key_event = wpeInputMethodContextCollaboFilterKeyEvent;
++    contextClass->focus_in = wpeInputMethodContextCollaboFocusIn;
++    contextClass->focus_out = wpeInputMethodContextCollaboFocusOut;
++    contextClass->set_cursor_area = wpeInputMethodContextCollaboSetCursorArea;
++    contextClass->reset = wpeInputMethodContextCollaboReset;
++}
++
++static void wpe_input_method_context_collabo_init(WPEInputMethodContextCollabo* self)
++{
++    self->preedit = new CString;
++    self->cursorBegin = -1;
++}
++
++// ── the clipboard: the server's, shared with every program and the `gui clipboard` command ────
++#define WPE_TYPE_CLIPBOARD_COLLABO (wpe_clipboard_collabo_get_type())
++G_DECLARE_FINAL_TYPE(WPEClipboardCollabo, wpe_clipboard_collabo, WPE, CLIPBOARD_COLLABO, WPEClipboard)
++struct _WPEClipboardCollabo {
++    WPEClipboard parent;
++    unsigned ownChanges; // CLIPBOARD_CHANGED events of our own setting still to come
++};
++G_DEFINE_FINAL_TYPE(WPEClipboardCollabo, wpe_clipboard_collabo, WPE_TYPE_CLIPBOARD)
++
++static GBytes* wpeClipboardCollaboRead(WPEClipboard*, const char* format);
++
++static void wpeClipboardCollaboChanged(WPEClipboard* clipboard, GPtrArray* formats, gboolean isLocal, WPEClipboardContent* content)
++{
++    WPE_CLIPBOARD_CLASS(wpe_clipboard_collabo_parent_class)->changed(clipboard, formats, isLocal, content);
++    if (!isLocal)
++        return;
++
++    // copied here: the content goes to the server, which keeps it after this program is gone
++    auto* display = wpe_clipboard_get_display(clipboard);
++    auto* gui = display && WPE_IS_DISPLAY_COLLABO(display) ? wpeDisplayCollaboGetConnection(WPE_DISPLAY_COLLABO(display)) : nullptr;
++    if (!gui)
++        return;
++    Vector<const char*> mimes;
++    Vector<const void*> data;
++    Vector<size_t> lengths;
++    Vector<GRefPtr<GBytes>> keep;
++    if (content) {
++        if (const char* text = wpe_clipboard_content_get_text(content)) {
++            for (const char* mime : { "text/plain;charset=utf-8", "UTF8_STRING", "text/plain" }) {
++                mimes.append(mime);
++                data.append(text);
++                lengths.append(strlen(text));
++            }
++        }
++        for (unsigned i = 0; formats && i < formats->len; ++i) {
++            const char* format = static_cast<const char*>(g_ptr_array_index(formats, i));
++            if (!format || g_str_has_prefix(format, "text/plain"))
++                continue;
++            if (GRefPtr<GBytes> bytes = wpe_clipboard_content_get_bytes(content, format)) {
++                gsize size;
++                const void* bytesData = g_bytes_get_data(bytes.get(), &size);
++                mimes.append(format);
++                data.append(bytesData);
++                lengths.append(size);
++                keep.append(WTF::move(bytes));
++            }
++        }
++    }
++    if (cg_clipboard_set(gui, mimes.size(), mimes.span().data(), data.span().data(), lengths.span().data()) >= 0)
++        WPE_CLIPBOARD_COLLABO(clipboard)->ownChanges++;
++}
++
++static void wpe_clipboard_collabo_class_init(WPEClipboardCollaboClass* klass)
++{
++    WPEClipboardClass* clipboardClass = WPE_CLIPBOARD_CLASS(klass);
++    clipboardClass->read = wpeClipboardCollaboRead;
++    clipboardClass->changed = wpeClipboardCollaboChanged;
++}
++
++static void wpe_clipboard_collabo_init(WPEClipboardCollabo*)
++{
++}
++
++// ── the display ────────────────────────────────────────────────────────────────────────────
++// An event read while waiting for another one (a clipboard read), handled later in order.
++struct QueuedEvent {
++    cg_event event;
++    CString text;
++    CString mime;
++    Vector<uint8_t> data;
++};
++
++struct _WPEDisplayCollaboPrivate {
++    cg_display* gui;
++    GRefPtr<GSource> source;
++    HashMap<uint32_t, WPEToplevelCollabo*> toplevels;
++    HashMap<WPEView*, WPEInputMethodContextCollabo*> inputMethodContexts;
++    Deque<QueuedEvent> queuedEvents;
++    GRefPtr<WPEKeymap> keymap;
++    uint32_t xModifiers;
++    double pointerX, pointerY;
++    bool lost;
++};
++WEBKIT_DEFINE_FINAL_TYPE_WITH_CODE(WPEDisplayCollabo, wpe_display_collabo, WPE_TYPE_DISPLAY, WPEDisplay,
++    wpeEnsureExtensionPointsRegistered();
++    g_io_extension_point_implement(WPE_DISPLAY_EXTENSION_POINT_NAME, g_define_type_id, "collabo", 100))
++
++cg_display* wpeDisplayCollaboGetConnection(WPEDisplayCollabo* display)
++{
++    return display->priv->lost ? nullptr : display->priv->gui;
++}
++
++void wpeDisplayCollaboAddToplevel(WPEDisplayCollabo* display, uint32_t canvas, WPEToplevelCollabo* toplevel)
++{
++    display->priv->toplevels.set(canvas, toplevel);
++}
++
++void wpeDisplayCollaboRemoveToplevel(WPEDisplayCollabo* display, uint32_t canvas)
++{
++    display->priv->toplevels.remove(canvas);
++}
++
++static guint32 eventTime()
++{
++    return static_cast<guint32>(g_get_monotonic_time() / 1000);
++}
++
++// X11 state bits and button mask (the server's) as WPE's modifiers
++static WPEModifiers wpeModifiers(uint32_t state, uint32_t buttons)
++{
++    unsigned modifiers = 0;
++    if (state & CG_MOD_SHIFT)
++        modifiers |= WPE_MODIFIER_KEYBOARD_SHIFT;
++    if (state & CG_MOD_CAPS_LOCK)
++        modifiers |= WPE_MODIFIER_KEYBOARD_CAPS_LOCK;
++    if (state & CG_MOD_CONTROL)
++        modifiers |= WPE_MODIFIER_KEYBOARD_CONTROL;
++    if (state & CG_MOD_ALT)
++        modifiers |= WPE_MODIFIER_KEYBOARD_ALT;
++    if (state & CG_MOD_SUPER)
++        modifiers |= WPE_MODIFIER_KEYBOARD_META;
++    if (buttons & CG_BUTTON_LEFT)
++        modifiers |= WPE_MODIFIER_POINTER_BUTTON1;
++    if (buttons & CG_BUTTON_MIDDLE)
++        modifiers |= WPE_MODIFIER_POINTER_BUTTON2;
++    if (buttons & CG_BUTTON_RIGHT)
++        modifiers |= WPE_MODIFIER_POINTER_BUTTON3;
++    return static_cast<WPEModifiers>(modifiers);
++}
++
++static uint32_t keyModifierBit(uint32_t keysym)
++{
++    switch (keysym) {
++    case 0xffe1: case 0xffe2: return CG_MOD_SHIFT;
++    case 0xffe3: case 0xffe4: return CG_MOD_CONTROL;
++    case 0xffe9: case 0xffea: return CG_MOD_ALT;
++    case 0xffeb: case 0xffec: return CG_MOD_SUPER;
++    }
++    return 0;
++}
++
++static void dispatchEvent(WPEDisplayCollabo* display, const cg_event& ev)
++{
++    auto* priv = display->priv;
++    switch (ev.type) {
++    case CG_EVENT_CLIPBOARD_CHANGED: {
++        auto* clipboard = WPE_CLIPBOARD_COLLABO(wpe_display_get_clipboard(WPE_DISPLAY(display)));
++        if (clipboard->ownChanges) {
++            clipboard->ownChanges--;
++            return;
++        }
++        // what the server has now; read on demand (wpeClipboardCollaboRead)
++        GRefPtr<GPtrArray> formats = adoptGRef(g_ptr_array_new());
++        GUniquePtr<char*> types(g_strsplit(ev.text, "\n", -1));
++        for (char** type = types.get(); *type; ++type) {
++            if (**type)
++                g_ptr_array_add(formats.get(), const_cast<char*>(g_intern_string(*type)));
++        }
++        g_ptr_array_add(formats.get(), nullptr);
++        WPE_CLIPBOARD_GET_CLASS(clipboard)->changed(WPE_CLIPBOARD(clipboard), formats->len > 1 ? formats.get() : nullptr, FALSE, nullptr);
++        return;
++    }
++    case CG_EVENT_CLIPBOARD_DATA:
++        return; // the answer to a read that gave up waiting
++    case CG_EVENT_ERROR:
++        g_warning("WPE collabo display: the display server says: %s", ev.text);
++        return;
++    default:
++        break;
++    }
++
++    auto* toplevel = priv->toplevels.get(ev.canvas);
++    if (!toplevel)
++        return;
++    auto* view = wpeToplevelCollaboGetView(toplevel);
++
++    switch (ev.type) {
++    case CG_EVENT_CONFIGURE:
++        wpeToplevelCollaboConfigure(toplevel, ev.width, ev.height);
++        return;
++    case CG_EVENT_CLOSE:
++        wpe_toplevel_closed(WPE_TOPLEVEL(toplevel));
++        return;
++    case CG_EVENT_FRAME_DONE:
++        if (view)
++            wpeViewCollaboFrameDone(WPE_VIEW_COLLABO(view), ev.serial);
++        return;
++    default:
++        break;
++    }
++    if (!view)
++        return;
++
++    GRefPtr<WPEEvent> event;
++    switch (ev.type) {
++    case CG_EVENT_FOCUS:
++        if (ev.focused) {
++            wpe_toplevel_state_changed(WPE_TOPLEVEL(toplevel), static_cast<WPEToplevelState>(wpe_toplevel_get_state(WPE_TOPLEVEL(toplevel)) | WPE_TOPLEVEL_STATE_ACTIVE));
++            wpe_view_focus_in(view);
++        } else {
++            wpe_view_focus_out(view);
++            wpe_toplevel_state_changed(WPE_TOPLEVEL(toplevel), static_cast<WPEToplevelState>(wpe_toplevel_get_state(WPE_TOPLEVEL(toplevel)) & ~WPE_TOPLEVEL_STATE_ACTIVE));
++        }
++        return;
++    case CG_EVENT_POINTER_ENTER:
++    case CG_EVENT_POINTER_MOTION: {
++        double dx = ev.x - priv->pointerX, dy = ev.y - priv->pointerY;
++        priv->pointerX = ev.x;
++        priv->pointerY = ev.y;
++        priv->xModifiers = ev.modifiers;
++        event = adoptGRef(wpe_event_pointer_move_new(ev.type == CG_EVENT_POINTER_ENTER ? WPE_EVENT_POINTER_ENTER : WPE_EVENT_POINTER_MOVE,
++            view, WPE_INPUT_SOURCE_MOUSE, eventTime(), wpeModifiers(ev.modifiers, ev.buttons), ev.x, ev.y, dx, dy));
++        break;
++    }
++    case CG_EVENT_POINTER_LEAVE:
++        event = adoptGRef(wpe_event_pointer_move_new(WPE_EVENT_POINTER_LEAVE, view, WPE_INPUT_SOURCE_MOUSE, eventTime(),
++            wpeModifiers(priv->xModifiers, 0), priv->pointerX, priv->pointerY, 0, 0));
++        break;
++    case CG_EVENT_POINTER_BUTTON: {
++        priv->pointerX = ev.x;
++        priv->pointerY = ev.y;
++        priv->xModifiers = ev.modifiers;
++        auto time = eventTime();
++        unsigned pressCount = ev.pressed ? wpe_view_compute_press_count(view, ev.x, ev.y, ev.button, time) : 0;
++        event = adoptGRef(wpe_event_pointer_button_new(ev.pressed ? WPE_EVENT_POINTER_DOWN : WPE_EVENT_POINTER_UP, view, WPE_INPUT_SOURCE_MOUSE,
++            time, wpeModifiers(ev.modifiers, ev.buttons), ev.button, ev.x, ev.y, pressCount));
++        break;
++    }
++    case CG_EVENT_SCROLL:
++        // WPE's deltas are positive upwards; the server's +dy and steps go down. Wheel notches
++        // when there are any (as a wheel), else pixels (as a touchpad).
++        if (ev.steps_x || ev.steps_y) {
++            event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, eventTime(), wpeModifiers(ev.modifiers, 0),
++                -ev.steps_x, -ev.steps_y, FALSE, FALSE, ev.x, ev.y));
++        } else {
++            event = adoptGRef(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_TOUCHPAD, eventTime(), wpeModifiers(ev.modifiers, 0),
++                -ev.dx, -ev.dy, TRUE, FALSE, ev.x, ev.y));
++        }
++        break;
++    case CG_EVENT_KEY: {
++        // the modifiers before this key, as the event says; after it, for the keymap
++        uint32_t bit = keyModifierBit(ev.keysym);
++        uint32_t after = bit ? (ev.pressed ? (ev.modifiers | bit) : (ev.modifiers & ~bit)) : ev.modifiers;
++        priv->xModifiers = after;
++        WPE_KEYMAP_COLLABO(wpe_display_get_keymap(WPE_DISPLAY(display)))->modifiers = wpeModifiers(after, 0);
++        event = adoptGRef(wpe_event_keyboard_new(ev.pressed ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP, view, WPE_INPUT_SOURCE_KEYBOARD,
++            eventTime(), wpeModifiers(ev.modifiers, 0), ev.keycode ? ev.keycode + 8 : 0, ev.keysym));
++        break;
++    }
++    case CG_EVENT_TEXT:
++    case CG_EVENT_PREEDIT: {
++        auto* context = priv->inputMethodContexts.get(view);
++        if (!context)
++            return;
++        if (ev.type == CG_EVENT_PREEDIT) {
++            imContextSetPreedit(context, ev.text, ev.cursor_begin);
++            return;
++        }
++        imContextSetPreedit(context, nullptr, -1);
++        g_signal_emit_by_name(context, "committed", ev.text);
++        return;
++    }
++    default:
++        return;
++    }
++    if (event)
++        wpe_view_event(view, event.get());
++}
++
++static void queueEvent(WPEDisplayCollabo* display, const cg_event& ev)
++{
++    QueuedEvent queued { ev, CString(ev.text), CString(ev.mime), { } };
++    if (ev.data && ev.length)
++        queued.data.append(std::span { static_cast<const uint8_t*>(ev.data), ev.length });
++    display->priv->queuedEvents.append(WTF::move(queued));
++}
++
++static void connectionLost(WPEDisplayCollabo* display)
++{
++    auto* priv = display->priv;
++    if (priv->lost)
++        return;
++    priv->lost = true;
++    g_warning("WPE collabo display: lost the display server: %s", cg_error(priv->gui));
++    // no display, no window: as if each were closed
++    auto toplevels = copyToVector(priv->toplevels.values());
++    for (auto* toplevel : toplevels)
++        wpe_toplevel_closed(WPE_TOPLEVEL(toplevel));
++}
++
++static void dispatchPending(WPEDisplayCollabo* display)
++{
++    auto* priv = display->priv;
++    while (!priv->queuedEvents.isEmpty()) {
++        auto queued = priv->queuedEvents.takeFirst();
++        queued.event.text = queued.text.data() ? queued.text.data() : "";
++        queued.event.mime = queued.mime.data() ? queued.mime.data() : "";
++        queued.event.data = queued.data.span().data();
++        queued.event.length = queued.data.size();
++        dispatchEvent(display, queued.event);
++    }
++    if (priv->lost)
++        return;
++    cg_event ev;
++    for (;;) {
++        int result = cg_next_event(priv->gui, &ev, 0);
++        if (result < 0) {
++            connectionLost(display);
++            return;
++        }
++        if (!result)
++            return;
++        dispatchEvent(display, ev);
++    }
++}
++
++// The clipboard's data in `format`, asked from the server and waited for (a paste is a
++// synchronous read; other events met meanwhile are handled after).
++static GBytes* wpeClipboardCollaboRead(WPEClipboard* clipboard, const char* format)
++{
++    auto* display = wpe_clipboard_get_display(clipboard);
++    if (!display || !WPE_IS_DISPLAY_COLLABO(display))
++        return nullptr;
++    auto* collabo = WPE_DISPLAY_COLLABO(display);
++    auto* gui = wpeDisplayCollaboGetConnection(collabo);
++    if (!gui)
++        return nullptr;
++    uint32_t request = cg_clipboard_request(gui, format);
++    if (!request)
++        return nullptr;
++    gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
++    cg_event ev;
++    for (;;) {
++        gint64 left = (deadline - g_get_monotonic_time()) / 1000;
++        if (left <= 0)
++            return nullptr;
++        int result = cg_next_event(gui, &ev, static_cast<int>(left));
++        if (result < 0) {
++            connectionLost(collabo);
++            return nullptr;
++        }
++        if (!result)
++            return nullptr;
++        if (ev.type == CG_EVENT_CLIPBOARD_DATA && ev.request == request)
++            return ev.found ? g_bytes_new(ev.data, ev.length) : nullptr;
++        queueEvent(collabo, ev);
++    }
++}
++
++struct DisplaySource {
++    GSource source;
++    gpointer fdTag;
++    WPEDisplayCollabo* display;
++};
++
++static GSourceFuncs displaySourceFuncs = {
++    // prepare: what was received is handled and drawn; tell the server (gui commands that wait
++    // for the program, as after input), and run at once if events are queued
++    [](GSource* source, gint* timeout) -> gboolean {
++        auto* display = reinterpret_cast<DisplaySource*>(source)->display;
++        *timeout = -1;
++        if (!display->priv->lost)
++            cg_flush(display->priv->gui);
++        return !display->priv->queuedEvents.isEmpty();
++    },
++    // check
++    [](GSource* source) -> gboolean {
++        auto* displaySource = reinterpret_cast<DisplaySource*>(source);
++        return !displaySource->display->priv->queuedEvents.isEmpty()
++            || (g_source_query_unix_fd(source, displaySource->fdTag) & (G_IO_IN | G_IO_HUP | G_IO_ERR));
++    },
++    // dispatch
++    [](GSource* source, GSourceFunc, gpointer) -> gboolean {
++        auto* display = reinterpret_cast<DisplaySource*>(source)->display;
++        GRefPtr<WPEDisplayCollabo> protect(display);
++        dispatchPending(display);
++        return display->priv->lost ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
++    },
++    nullptr, // finalize
++    nullptr, // closure_callback
++    nullptr, // closure_marshall
++};
++
++static gboolean wpeDisplayCollaboConnect(WPEDisplay* display, GError** error)
++{
++    auto* priv = WPE_DISPLAY_COLLABO(display)->priv;
++    if (priv->gui)
++        return TRUE;
++    // named after the program unless `gui run --name` started it (the server knows it then)
++    priv->gui = cg_connect(g_getenv("COLLABO_GUI_NAME") ? nullptr : g_get_prgname());
++    if (!priv->gui) {
++        g_set_error(error, WPE_DISPLAY_ERROR, WPE_DISPLAY_ERROR_CONNECTION_FAILED, "Cannot reach the collaboCore display server: %s", cg_connect_error());
++        return FALSE;
++    }
++
++    priv->source = adoptGRef(g_source_new(&displaySourceFuncs, sizeof(DisplaySource)));
++    auto* displaySource = reinterpret_cast<DisplaySource*>(priv->source.get());
++    displaySource->display = WPE_DISPLAY_COLLABO(display);
++    displaySource->fdTag = g_source_add_unix_fd(priv->source.get(), cg_fd(priv->gui), static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR));
++    g_source_set_name(priv->source.get(), "WPE collabo display");
++    g_source_set_priority(priv->source.get(), RunLoopSourcePriority::RunLoopDispatcher);
++    g_source_set_can_recurse(priv->source.get(), TRUE);
++    g_source_attach(priv->source.get(), g_main_context_get_thread_default());
++    return TRUE;
++}
++
++static WPEView* wpeDisplayCollaboCreateView(WPEDisplay* display)
++{
++    return WPE_VIEW(g_object_new(WPE_TYPE_VIEW_COLLABO, "display", display, nullptr));
++}
++
++static WPEToplevel* wpeDisplayCollaboCreateToplevel(WPEDisplay* display, guint maxViews)
++{
++    return WPE_TOPLEVEL(g_object_new(WPE_TYPE_TOPLEVEL_COLLABO, "display", display, "max-views", std::min(maxViews, 1u), nullptr));
++}
++
++static gpointer wpeDisplayCollaboGetEGLDisplay(WPEDisplay*, GError** error)
++{
++    g_set_error_literal(error, WPE_EGL_ERROR, WPE_EGL_ERROR_NOT_AVAILABLE, "The collaboCore display renders on the CPU: there is no EGL");
++    return nullptr;
++}
++
++static WPEKeymap* wpeDisplayCollaboGetKeymap(WPEDisplay* display)
++{
++    auto* priv = WPE_DISPLAY_COLLABO(display)->priv;
++    if (!priv->keymap)
++        priv->keymap = adoptGRef(WPE_KEYMAP(g_object_new(WPE_TYPE_KEYMAP_COLLABO, nullptr)));
++    return priv->keymap.get();
++}
++
++static WPEClipboard* wpeDisplayCollaboGetClipboard(WPEDisplay* display)
++{
++    return WPE_CLIPBOARD(g_object_new(WPE_TYPE_CLIPBOARD_COLLABO, "display", display, nullptr));
++}
++
++static WPEInputMethodContext* wpeDisplayCollaboCreateInputMethodContext(WPEDisplay* display, WPEView* view)
++{
++    auto* context = WPE_INPUT_METHOD_CONTEXT_COLLABO(g_object_new(WPE_TYPE_INPUT_METHOD_CONTEXT_COLLABO, "view", view, nullptr));
++    auto* priv = WPE_DISPLAY_COLLABO(display)->priv;
++    priv->inputMethodContexts.set(view, context);
++    struct Forget {
++        WPEDisplayCollabo* display;
++        WPEView* view;
++    };
++    g_object_weak_ref(G_OBJECT(context), [](gpointer data, GObject* context) {
++        auto* forget = static_cast<Forget*>(data);
++        auto& contexts = forget->display->priv->inputMethodContexts;
++        auto it = contexts.find(forget->view);
++        if (it != contexts.end() && G_OBJECT(it->value) == context)
++            contexts.remove(it);
++        g_free(forget);
++    }, new (g_malloc(sizeof(Forget))) Forget { WPE_DISPLAY_COLLABO(display), view });
++    return WPE_INPUT_METHOD_CONTEXT(context);
++}
++
++static void wpeDisplayCollaboDispose(GObject* object)
++{
++    auto* priv = WPE_DISPLAY_COLLABO(object)->priv;
++    if (priv->source) {
++        g_source_destroy(priv->source.get());
++        priv->source = nullptr;
++    }
++    if (priv->gui) {
++        cg_disconnect(priv->gui);
++        priv->gui = nullptr;
++    }
++    G_OBJECT_CLASS(wpe_display_collabo_parent_class)->dispose(object);
++}
++
++static void wpe_display_collabo_class_init(WPEDisplayCollaboClass* displayCollaboClass)
++{
++    GObjectClass* objectClass = G_OBJECT_CLASS(displayCollaboClass);
++    objectClass->dispose = wpeDisplayCollaboDispose;
++
++    WPEDisplayClass* displayClass = WPE_DISPLAY_CLASS(displayCollaboClass);
++    displayClass->connect = wpeDisplayCollaboConnect;
++    displayClass->create_view = wpeDisplayCollaboCreateView;
++    displayClass->create_toplevel = wpeDisplayCollaboCreateToplevel;
++    displayClass->get_egl_display = wpeDisplayCollaboGetEGLDisplay;
++    displayClass->get_keymap = wpeDisplayCollaboGetKeymap;
++    displayClass->get_clipboard = wpeDisplayCollaboGetClipboard;
++    displayClass->create_input_method_context = wpeDisplayCollaboCreateInputMethodContext;
++}
++
++/**
++ * wpe_display_collabo_new:
++ *
++ * Create a new #WPEDisplayCollabo; wpe_display_connect() reaches the display server.
++ *
++ * Returns: (transfer full): a #WPEDisplay
++ */
++WPEDisplay* wpe_display_collabo_new(void)
++{
++    return WPE_DISPLAY(g_object_new(WPE_TYPE_DISPLAY_COLLABO, nullptr));
++}
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPEDisplayCollabo.h b/Source/WebKit/WPEPlatform/wpe/collabo/WPEDisplayCollabo.h
+new file mode 100644
+index 00000000..af375d6f
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPEDisplayCollabo.h
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef WPEDisplayCollabo_h
++#define WPEDisplayCollabo_h
++
++#if !defined(__WPE_COLLABO_H_INSIDE__) && !defined(BUILDING_WEBKIT)
++#error "Only <wpe/collabo/wpe-collabo.h> can be included directly."
++#endif
++
++#include <glib-object.h>
++#include <wpe/wpe-platform.h>
++
++G_BEGIN_DECLS
++
++#define WPE_TYPE_DISPLAY_COLLABO (wpe_display_collabo_get_type())
++WPE_API G_DECLARE_FINAL_TYPE (WPEDisplayCollabo, wpe_display_collabo, WPE, DISPLAY_COLLABO, WPEDisplay)
++
++WPE_API WPEDisplay *wpe_display_collabo_new (void);
++
++G_END_DECLS
++
++#endif /* WPEDisplayCollabo_h */
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPEToplevelCollabo.cpp b/Source/WebKit/WPEPlatform/wpe/collabo/WPEToplevelCollabo.cpp
+new file mode 100644
+index 00000000..584e3703
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPEToplevelCollabo.cpp
+@@ -0,0 +1,151 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "WPEToplevelCollabo.h"
++
++#include "WPECollaboPrivate.h"
++#include <wtf/glib/WTFGType.h>
++
++/**
++ * WPEToplevelCollabo:
++ *
++ * The [class@WPEPlatform.Toplevel] of [class@DisplayCollabo]: a canvas of the display server.
++ * The server decides its size (within its limits; `gui resize` changes it); the toplevel's view
++ * is always as big as the canvas.
++ */
++struct _WPEToplevelCollaboPrivate {
++    uint32_t canvas;
++};
++WEBKIT_DEFINE_FINAL_TYPE(WPEToplevelCollabo, wpe_toplevel_collabo, WPE_TYPE_TOPLEVEL, WPEToplevel)
++
++uint32_t wpeToplevelCollaboGetCanvas(WPEToplevelCollabo* toplevel)
++{
++    return toplevel->priv->canvas;
++}
++
++WPEView* wpeToplevelCollaboGetView(WPEToplevelCollabo* toplevel)
++{
++    WPEView* view = nullptr;
++    wpe_toplevel_foreach_view(WPE_TOPLEVEL(toplevel), [](WPEToplevel*, WPEView* view, gpointer userData) -> gboolean {
++        *static_cast<WPEView**>(userData) = view;
++        return TRUE;
++    }, &view);
++    return view;
++}
++
++void wpeToplevelCollaboConfigure(WPEToplevelCollabo* toplevel, uint32_t width, uint32_t height)
++{
++    wpe_toplevel_resized(WPE_TOPLEVEL(toplevel), width, height);
++    wpe_toplevel_foreach_view(WPE_TOPLEVEL(toplevel), [](WPEToplevel* toplevel, WPEView* view, gpointer) -> gboolean {
++        int width, height;
++        wpe_toplevel_get_size(toplevel, &width, &height);
++        wpe_view_resized(view, width, height);
++        return FALSE;
++    }, nullptr);
++}
++
++static cg_display* connectionOf(WPEToplevel* toplevel)
++{
++    auto* display = wpe_toplevel_get_display(toplevel);
++    return display && WPE_IS_DISPLAY_COLLABO(display) ? wpeDisplayCollaboGetConnection(WPE_DISPLAY_COLLABO(display)) : nullptr;
++}
++
++static void wpeToplevelCollaboConstructed(GObject* object)
++{
++    G_OBJECT_CLASS(wpe_toplevel_collabo_parent_class)->constructed(object);
++
++    auto* toplevel = WPE_TOPLEVEL(object);
++    auto* priv = WPE_TOPLEVEL_COLLABO(object)->priv;
++    if (auto* gui = connectionOf(toplevel)) {
++        // the server's default size (or `gui run --size`); a later resize() asks for another
++        priv->canvas = cg_canvas_create(gui, 0, 0, g_get_application_name() ? g_get_application_name() : "Web");
++        if (priv->canvas) {
++            wpeDisplayCollaboAddToplevel(WPE_DISPLAY_COLLABO(wpe_toplevel_get_display(toplevel)), priv->canvas, WPE_TOPLEVEL_COLLABO(object));
++            uint32_t width = 0, height = 0;
++            cg_canvas_size(gui, priv->canvas, &width, &height);
++            if (width && height)
++                wpe_toplevel_resized(toplevel, width, height);
++        } else
++            g_warning("WPE collabo display: no canvas: %s", cg_error(gui));
++    }
++    wpe_toplevel_state_changed(toplevel, WPE_TOPLEVEL_STATE_ACTIVE);
++}
++
++static void wpeToplevelCollaboDispose(GObject* object)
++{
++    auto* toplevel = WPE_TOPLEVEL(object);
++    auto* priv = WPE_TOPLEVEL_COLLABO(object)->priv;
++    if (priv->canvas) {
++        if (auto* display = wpe_toplevel_get_display(toplevel))
++            wpeDisplayCollaboRemoveToplevel(WPE_DISPLAY_COLLABO(display), priv->canvas);
++        if (auto* gui = connectionOf(toplevel))
++            cg_canvas_destroy(gui, priv->canvas);
++        priv->canvas = 0;
++    }
++    G_OBJECT_CLASS(wpe_toplevel_collabo_parent_class)->dispose(object);
++}
++
++static void wpeToplevelCollaboSetTitle(WPEToplevel* toplevel, const char* title)
++{
++    auto* priv = WPE_TOPLEVEL_COLLABO(toplevel)->priv;
++    if (auto* gui = connectionOf(toplevel); gui && priv->canvas)
++        cg_canvas_set_title(gui, priv->canvas, title ? title : "");
++}
++
++static gboolean wpeToplevelCollaboResize(WPEToplevel* toplevel, int width, int height)
++{
++    // the server answers with the size it gives (CONFIGURE)
++    auto* priv = WPE_TOPLEVEL_COLLABO(toplevel)->priv;
++    auto* gui = connectionOf(toplevel);
++    if (!gui || !priv->canvas || width <= 0 || height <= 0)
++        return FALSE;
++    return cg_canvas_request_size(gui, priv->canvas, width, height) >= 0;
++}
++
++static gboolean wpeToplevelCollaboSetState(WPEToplevel* toplevel, WPEToplevelState flag, gboolean set)
++{
++    auto state = wpe_toplevel_get_state(toplevel);
++    state = static_cast<WPEToplevelState>(set ? (state | flag) : (state & ~flag));
++    wpe_toplevel_state_changed(toplevel, state);
++    return TRUE;
++}
++
++static void wpe_toplevel_collabo_class_init(WPEToplevelCollaboClass* toplevelCollaboClass)
++{
++    GObjectClass* objectClass = G_OBJECT_CLASS(toplevelCollaboClass);
++    objectClass->constructed = wpeToplevelCollaboConstructed;
++    objectClass->dispose = wpeToplevelCollaboDispose;
++
++    WPEToplevelClass* toplevelClass = WPE_TOPLEVEL_CLASS(toplevelCollaboClass);
++    toplevelClass->set_title = wpeToplevelCollaboSetTitle;
++    toplevelClass->resize = wpeToplevelCollaboResize;
++    toplevelClass->set_fullscreen = [](WPEToplevel* toplevel, gboolean fullscreen) -> gboolean {
++        return wpeToplevelCollaboSetState(toplevel, WPE_TOPLEVEL_STATE_FULLSCREEN, fullscreen);
++    };
++    toplevelClass->set_maximized = [](WPEToplevel* toplevel, gboolean maximized) -> gboolean {
++        return wpeToplevelCollaboSetState(toplevel, WPE_TOPLEVEL_STATE_MAXIMIZED, maximized);
++    };
++}
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPEToplevelCollabo.h b/Source/WebKit/WPEPlatform/wpe/collabo/WPEToplevelCollabo.h
+new file mode 100644
+index 00000000..d290fe2f
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPEToplevelCollabo.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef WPEToplevelCollabo_h
++#define WPEToplevelCollabo_h
++
++#if !defined(__WPE_COLLABO_H_INSIDE__) && !defined(BUILDING_WEBKIT)
++#error "Only <wpe/collabo/wpe-collabo.h> can be included directly."
++#endif
++
++#include <glib-object.h>
++#include <wpe/wpe-platform.h>
++
++G_BEGIN_DECLS
++
++#define WPE_TYPE_TOPLEVEL_COLLABO (wpe_toplevel_collabo_get_type())
++WPE_API G_DECLARE_FINAL_TYPE (WPEToplevelCollabo, wpe_toplevel_collabo, WPE, TOPLEVEL_COLLABO, WPEToplevel)
++
++G_END_DECLS
++
++#endif /* WPEToplevelCollabo_h */
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPEViewCollabo.cpp b/Source/WebKit/WPEPlatform/wpe/collabo/WPEViewCollabo.cpp
+new file mode 100644
+index 00000000..12678cf7
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPEViewCollabo.cpp
+@@ -0,0 +1,169 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "WPEViewCollabo.h"
++
++#include "WPECollaboPrivate.h"
++#include <wtf/Vector.h>
++#include <wtf/glib/GRefPtr.h>
++#include <wtf/glib/WTFGType.h>
++
++/**
++ * WPEViewCollabo:
++ *
++ * The [class@WPEPlatform.View] of [class@DisplayCollabo]. Each buffer WebKit renders (shared
++ * memory, on the CPU) goes to the toplevel's canvas, its damaged rectangles only; the buffer is
++ * rendered when the server says the frame is on the canvas, which paces the web process to what
++ * the display takes.
++ */
++struct _WPEViewCollaboPrivate {
++    GRefPtr<WPEBuffer> pendingBuffer;
++    GRefPtr<WPEBuffer> committedBuffer;
++    int64_t pendingSerial;
++};
++WEBKIT_DEFINE_FINAL_TYPE(WPEViewCollabo, wpe_view_collabo, WPE_TYPE_VIEW, WPEView)
++
++static uint32_t canvasOf(WPEView* view)
++{
++    auto* toplevel = wpe_view_get_toplevel(view);
++    return toplevel && WPE_IS_TOPLEVEL_COLLABO(toplevel) ? wpeToplevelCollaboGetCanvas(WPE_TOPLEVEL_COLLABO(toplevel)) : 0;
++}
++
++static cg_display* connectionOf(WPEView* view)
++{
++    auto* display = wpe_view_get_display(view);
++    return display && WPE_IS_DISPLAY_COLLABO(display) ? wpeDisplayCollaboGetConnection(WPE_DISPLAY_COLLABO(display)) : nullptr;
++}
++
++void wpeViewCollaboFrameDone(WPEViewCollabo* viewCollabo, uint32_t serial)
++{
++    auto* view = WPE_VIEW(viewCollabo);
++    auto* priv = viewCollabo->priv;
++    if (!priv->pendingBuffer || serial != priv->pendingSerial)
++        return;
++    if (priv->committedBuffer && priv->committedBuffer != priv->pendingBuffer)
++        wpe_view_buffer_released(view, priv->committedBuffer.get());
++    priv->committedBuffer = WTF::move(priv->pendingBuffer);
++    wpe_view_buffer_rendered(view, priv->committedBuffer.get());
++}
++
++static void wpeViewCollaboToplevelChanged(WPEView* view, GParamSpec*, gpointer)
++{
++    auto* toplevel = wpe_view_get_toplevel(view);
++    if (!toplevel) {
++        wpe_view_unmap(view);
++        return;
++    }
++    int width, height;
++    wpe_toplevel_get_size(toplevel, &width, &height);
++    if (width && height)
++        wpe_view_resized(view, width, height);
++    wpe_view_map(view);
++}
++
++static void wpeViewCollaboConstructed(GObject* object)
++{
++    G_OBJECT_CLASS(wpe_view_collabo_parent_class)->constructed(object);
++
++    g_signal_connect(object, "notify::toplevel", G_CALLBACK(wpeViewCollaboToplevelChanged), nullptr);
++}
++
++static gboolean wpeViewCollaboRenderBuffer(WPEView* view, WPEBuffer* buffer, const WPERectangle* damageRects, guint damageCount, GError** error)
++{
++    auto* priv = WPE_VIEW_COLLABO(view)->priv;
++    auto* gui = connectionOf(view);
++    auto canvas = canvasOf(view);
++    if (!gui || !canvas) {
++        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "The view has no canvas");
++        return FALSE;
++    }
++    if (!WPE_IS_BUFFER_SHM(buffer)) {
++        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Only shared memory buffers can be shown on the collaboCore display");
++        return FALSE;
++    }
++
++    auto* shm = WPE_BUFFER_SHM(buffer);
++    gsize size;
++    const auto* pixels = static_cast<const uint8_t*>(g_bytes_get_data(wpe_buffer_shm_get_data(shm), &size));
++    auto stride = wpe_buffer_shm_get_stride(shm);
++    int width = wpe_buffer_get_width(buffer), height = wpe_buffer_get_height(buffer);
++    if (width <= 0 || height <= 0 || static_cast<gsize>(stride) * height > size) {
++        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Invalid buffer");
++        return FALSE;
++    }
++
++    // the damage within the buffer; none (or a first frame) sends all of it
++    Vector<cg_rect, 8> rects;
++    if (priv->committedBuffer || priv->pendingBuffer) {
++        for (guint i = 0; i < damageCount; ++i) {
++            int x0 = std::clamp(damageRects[i].x, 0, width), y0 = std::clamp(damageRects[i].y, 0, height);
++            int x1 = std::clamp(damageRects[i].x + damageRects[i].width, 0, width), y1 = std::clamp(damageRects[i].y + damageRects[i].height, 0, height);
++            if (x1 > x0 && y1 > y0)
++                rects.append({ static_cast<uint32_t>(x0), static_cast<uint32_t>(y0), static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) });
++        }
++        if (damageCount && rects.isEmpty())
++            rects.append({ 0, 0, 1, 1 });
++    }
++    int64_t serial = cg_canvas_present(gui, canvas, pixels, stride, width, height, rects.isEmpty() ? nullptr : rects.span().data(), rects.size());
++    if (serial < 0) {
++        g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "The display server took no frame: %s", cg_error(gui));
++        return FALSE;
++    }
++
++    // a frame not yet on the canvas is replaced: release it, it will not be rendered
++    if (priv->pendingBuffer && priv->pendingBuffer != buffer && priv->pendingBuffer != priv->committedBuffer)
++        wpe_view_buffer_released(view, priv->pendingBuffer.get());
++    priv->pendingBuffer = buffer;
++    priv->pendingSerial = serial;
++    return TRUE;
++}
++
++static void wpeViewCollaboSetCursorFromName(WPEView* view, const char* name)
++{
++    auto* gui = connectionOf(view);
++    auto canvas = canvasOf(view);
++    if (gui && canvas)
++        cg_canvas_set_cursor(gui, canvas, name ? name : "default");
++}
++
++static void wpeViewCollaboDispose(GObject* object)
++{
++    auto* priv = WPE_VIEW_COLLABO(object)->priv;
++    priv->pendingBuffer = nullptr;
++    priv->committedBuffer = nullptr;
++    G_OBJECT_CLASS(wpe_view_collabo_parent_class)->dispose(object);
++}
++
++static void wpe_view_collabo_class_init(WPEViewCollaboClass* viewCollaboClass)
++{
++    GObjectClass* objectClass = G_OBJECT_CLASS(viewCollaboClass);
++    objectClass->constructed = wpeViewCollaboConstructed;
++    objectClass->dispose = wpeViewCollaboDispose;
++
++    WPEViewClass* viewClass = WPE_VIEW_CLASS(viewCollaboClass);
++    viewClass->render_buffer = wpeViewCollaboRenderBuffer;
++    viewClass->set_cursor_from_name = wpeViewCollaboSetCursorFromName;
++}
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/WPEViewCollabo.h b/Source/WebKit/WPEPlatform/wpe/collabo/WPEViewCollabo.h
+new file mode 100644
+index 00000000..b198352a
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/WPEViewCollabo.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef WPEViewCollabo_h
++#define WPEViewCollabo_h
++
++#if !defined(__WPE_COLLABO_H_INSIDE__) && !defined(BUILDING_WEBKIT)
++#error "Only <wpe/collabo/wpe-collabo.h> can be included directly."
++#endif
++
++#include <glib-object.h>
++#include <wpe/wpe-platform.h>
++
++G_BEGIN_DECLS
++
++#define WPE_TYPE_VIEW_COLLABO (wpe_view_collabo_get_type())
++WPE_API G_DECLARE_FINAL_TYPE (WPEViewCollabo, wpe_view_collabo, WPE, VIEW_COLLABO, WPEView)
++
++G_END_DECLS
++
++#endif /* WPEViewCollabo_h */
+diff --git a/Source/WebKit/WPEPlatform/wpe/collabo/wpe-collabo.h b/Source/WebKit/WPEPlatform/wpe/collabo/wpe-collabo.h
+new file mode 100644
+index 00000000..dbc64821
+--- /dev/null
++++ b/Source/WebKit/WPEPlatform/wpe/collabo/wpe-collabo.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 2026 the collaboCore authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef __WPE_COLLABO_H__
++#define __WPE_COLLABO_H__
++
++#define __WPE_COLLABO_H_INSIDE__
++
++#include <wpe/collabo/WPEDisplayCollabo.h>
++#include <wpe/collabo/WPEToplevelCollabo.h>
++#include <wpe/collabo/WPEViewCollabo.h>
++
++#undef __WPE_COLLABO_H_INSIDE__
++
++#endif /* __WPE_COLLABO_H__ */

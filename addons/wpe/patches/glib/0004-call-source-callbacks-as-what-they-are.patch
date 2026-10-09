@@ -1,0 +1,269 @@
+Call source callbacks as what they really are: a callback given as another type than the one it is
+called as (a gboolean function as a GChildWatchFunc: GSubprocess; a void one as a GSourceFunc)
+traps on WebAssembly, which checks the type of every call through a pointer. Uses the add-on's
+libffi (ffi_wasm_call) when the program has it.
+
+diff -ruN glibtest3/gio/gcancellable.c glibtest4/gio/gcancellable.c
+--- a/gio/gcancellable.c	2026-10-03 23:17:41.205983368 +0000
++++ b/gio/gcancellable.c	2026-10-04 00:12:25.619383417 +0000
+@@ -778,7 +778,7 @@
+   GCancellableSource *cancellable_source = (GCancellableSource *)source;
+ 
+   g_source_set_ready_time (source, -1);
+-  return (*func) (cancellable_source->cancellable, user_data);
++  return g_callback_call_b_pp ((gpointer) func, cancellable_source->cancellable, user_data);
+ }
+ 
+ static void
+diff -ruN glibtest3/gio/gpollableutils.c glibtest4/gio/gpollableutils.c
+--- a/gio/gpollableutils.c	2026-10-03 23:17:41.259067286 +0000
++++ b/gio/gpollableutils.c	2026-10-04 00:12:25.619340715 +0000
+@@ -25,6 +25,7 @@
+ #include "gpollableinputstream.h"
+ #include "gasynchelper.h"
+ #include "glibintl.h"
++#include "glib-private.h"
+ 
+ typedef struct {
+   GSource       source;
+@@ -40,7 +41,7 @@
+   GPollableSourceFunc func = (GPollableSourceFunc)callback;
+   GPollableSource *pollable_source = (GPollableSource *)source;
+ 
+-  return (*func) (pollable_source->stream, user_data);
++  return g_callback_call_b_pp ((gpointer) func, pollable_source->stream, user_data);
+ }
+ 
+ static void
+diff -ruN glibtest3/gio/gsocket.c glibtest4/gio/gsocket.c
+--- a/gio/gsocket.c	2026-10-03 23:17:54.467859923 +0000
++++ b/gio/gsocket.c	2026-10-04 00:12:25.619901571 +0000
+@@ -62,6 +62,7 @@
+ #include "gobject/gtype-private.h" /* For _PRELUDE type define */
+ #undef GOBJECT_COMPILATION
+ #include "gcancellable.h"
++#include "glib-private.h"
+ #include "gdatagrambased.h"
+ #include "gioenumtypes.h"
+ #include "ginetaddress.h"
+@@ -4309,7 +4310,7 @@
+       events |= (G_IO_IN | G_IO_OUT);
+     }
+ 
+-  ret = (*func) (socket, events & socket_source->condition, user_data);
++  ret = g_callback_call_b_pip ((gpointer) func, socket, events & socket_source->condition, user_data);
+ 
+   if (socket->priv->timeout && !g_socket_is_closed (socket_source->socket))
+     g_source_set_ready_time (source, g_get_monotonic_time () + socket->priv->timeout * 1000000);
+diff -ruN glibtest3/gio/gtask.c glibtest4/gio/gtask.c
+--- a/gio/gtask.c	2026-10-03 23:34:58.886732832 +0000
++++ b/gio/gtask.c	2026-10-04 00:12:25.620010357 +0000
+@@ -2412,7 +2412,7 @@
+                          GSourceFunc  callback,
+                          gpointer     user_data)
+ {
+-  return callback (user_data);
++  return g_callback_call_b_p ((gpointer) callback, user_data);
+ }
+ 
+ GSourceFuncs trivial_source_funcs = {
+diff -ruN glibtest3/glib/giounix.c glibtest4/glib/giounix.c
+--- a/glib/giounix.c	2026-10-03 23:17:41.368485158 +0000
++++ b/glib/giounix.c	2026-10-04 00:12:25.619253371 +0000
+@@ -49,6 +49,7 @@
+ #endif
+ 
+ #include "giochannel.h"
++#include "glib-private.h"
+ 
+ #include "gerror.h"
+ #include "gfileutils.h"
+@@ -167,9 +168,9 @@
+       return FALSE;
+     }
+   
+-  return (*func) (watch->channel,
+-		  (watch->pollfd.revents | buffer_condition) & watch->condition,
+-		  user_data);
++  return g_callback_call_b_pip ((gpointer) func, watch->channel,
++                                (watch->pollfd.revents | buffer_condition) & watch->condition,
++                                user_data);
+ }
+ 
+ static void 
+diff -ruN glibtest3/glib/glib-private.h glibtest4/glib/glib-private.h
+--- a/glib/glib-private.h	2026-10-03 23:17:41.370651849 +0000
++++ b/glib/glib-private.h	2026-10-04 00:12:25.617895986 +0000
+@@ -352,4 +352,98 @@
+ #define _g_datalist_id_update_atomic(datalist, key_id, callback, user_data) \
+   _g_datalist_id_update_atomic_full ((datalist), (key_id), FALSE, (callback), (user_data))
+ 
++/* Calls of callbacks as what they really are. Callbacks are often given as another type than the
++ * one they are called as (a function returning nothing as a GSourceFunc, a gboolean one as a
++ * GChildWatchFunc, one that leaves out its last parameters), which C tolerates on most machines;
++ * WebAssembly checks the type of every call through a pointer, so there the call goes through
++ * ffi_wasm_call (libffi for wasm32 as collaboCore's wpe add-on has it), which calls the function
++ * as its own type says: parameters it leaves out are not passed, a result it lacks is 0.
++ * The name says the call's type: v/b (no result, gboolean), then p/i per parameter. */
++#ifdef __wasm__
++/* weak: a program without that libffi (GLib alone) calls directly, as elsewhere */
++__attribute__ ((weak)) void ffi_wasm_call (void (*fn) (void), const char *sig, void *rvalue, void **avalue);
++#endif
++
++static inline gboolean
++g_callback_call_b_p (gpointer fn, gpointer a)
++{
++#ifdef __wasm__
++  if (ffi_wasm_call != NULL)
++    {
++      gboolean r = FALSE;
++      ffi_wasm_call ((void (*) (void)) fn, "i_i", &r, (void *[]) { &a });
++      return r;
++    }
++#endif
++  return ((gboolean (*) (gpointer)) fn) (a);
++}
++
++static inline void
++g_callback_call_v_p (gpointer fn, gpointer a)
++{
++#ifdef __wasm__
++  if (ffi_wasm_call != NULL)
++    {
++      ffi_wasm_call ((void (*) (void)) fn, "v_i", NULL, (void *[]) { &a });
++      return;
++    }
++#endif
++  ((void (*) (gpointer)) fn) (a);
++}
++
++static inline gboolean
++g_callback_call_b_pp (gpointer fn, gpointer a, gpointer b)
++{
++#ifdef __wasm__
++  if (ffi_wasm_call != NULL)
++    {
++      gboolean r = FALSE;
++      ffi_wasm_call ((void (*) (void)) fn, "i_ii", &r, (void *[]) { &a, &b });
++      return r;
++    }
++#endif
++  return ((gboolean (*) (gpointer, gpointer)) fn) (a, b);
++}
++
++static inline gboolean
++g_callback_call_b_pip (gpointer fn, gpointer a, gint b, gpointer c)
++{
++#ifdef __wasm__
++  if (ffi_wasm_call != NULL)
++    {
++      gboolean r = FALSE;
++      ffi_wasm_call ((void (*) (void)) fn, "i_iii", &r, (void *[]) { &a, &b, &c });
++      return r;
++    }
++#endif
++  return ((gboolean (*) (gpointer, gint, gpointer)) fn) (a, b, c);
++}
++
++static inline gboolean
++g_callback_call_b_iip (gpointer fn, gint a, gint b, gpointer c)
++{
++#ifdef __wasm__
++  if (ffi_wasm_call != NULL)
++    {
++      gboolean r = FALSE;
++      ffi_wasm_call ((void (*) (void)) fn, "i_iii", &r, (void *[]) { &a, &b, &c });
++      return r;
++    }
++#endif
++  return ((gboolean (*) (gint, gint, gpointer)) fn) (a, b, c);
++}
++
++static inline void
++g_callback_call_v_iip (gpointer fn, gint a, gint b, gpointer c)
++{
++#ifdef __wasm__
++  if (ffi_wasm_call != NULL)
++    {
++      ffi_wasm_call ((void (*) (void)) fn, "v_iii", NULL, (void *[]) { &a, &b, &c });
++      return;
++    }
++#endif
++  ((void (*) (gint, gint, gpointer)) fn) (a, b, c);
++}
++
+ #endif /* __GLIB_PRIVATE_H__ */
+diff -ruN glibtest3/glib/glib-unix.c glibtest4/glib/glib-unix.c
+--- a/glib/glib-unix.c	2026-10-03 23:17:41.370651849 +0000
++++ b/glib/glib-unix.c	2026-10-04 00:12:25.619298329 +0000
+@@ -318,7 +318,7 @@
+       return FALSE;
+     }
+ 
+-  return (* func) (fd_source->fd, g_source_query_unix_fd (source, fd_source->tag), user_data);
++  return g_callback_call_b_iip ((gpointer) func, fd_source->fd, g_source_query_unix_fd (source, fd_source->tag), user_data);
+ }
+ 
+ GSourceFuncs g_unix_fd_source_funcs = {
+diff -ruN glibtest3/glib/gmain.c glibtest4/glib/gmain.c
+--- a/glib/gmain.c	2026-10-03 23:17:41.374985230 +0000
++++ b/glib/gmain.c	2026-10-04 00:12:25.619172436 +0000
+@@ -5315,13 +5315,12 @@
+ 
+   if (timeout_source->one_shot)
+     {
+-      GSourceOnceFunc once_callback = (GSourceOnceFunc) callback;
+-      once_callback (user_data);
++      g_callback_call_v_p ((gpointer) callback, user_data);  /* a GSourceOnceFunc */
+       again = G_SOURCE_REMOVE;
+     }
+   else
+     {
+-      again = callback (user_data);
++      again = g_callback_call_b_p ((gpointer) callback, user_data);
+     }
+ 
+   TRACE (GLIB_TIMEOUT_DISPATCH (source, source->context, callback, user_data, again));
+@@ -5919,7 +5918,7 @@
+ 
+   g_atomic_int_set (&unix_signal_source->pending, FALSE);
+ 
+-  again = (callback) (user_data);
++  again = g_callback_call_b_p ((gpointer) callback, user_data);
+ 
+   return again;
+ }
+@@ -6068,7 +6067,6 @@
+ 			gpointer    user_data)
+ {
+   GChildWatchSource *child_watch_source;
+-  GChildWatchFunc child_watch_callback = (GChildWatchFunc) callback;
+   int wait_status;
+ 
+   child_watch_source = (GChildWatchSource *) source;
+@@ -6194,7 +6192,8 @@
+       return FALSE;
+     }
+ 
+-  (child_watch_callback) (child_watch_source->pid, wait_status, user_data);
++  /* a GChildWatchFunc */
++  g_callback_call_v_iip ((gpointer) callback, child_watch_source->pid, wait_status, user_data);
+ 
+   /* We never keep a child watch source around as the child is gone */
+   return FALSE;
+@@ -6483,13 +6482,12 @@
+ 
+   if (idle_source->one_shot)
+     {
+-      GSourceOnceFunc once_callback = (GSourceOnceFunc) callback;
+-      once_callback (user_data);
++      g_callback_call_v_p ((gpointer) callback, user_data);  /* a GSourceOnceFunc */
+       again = G_SOURCE_REMOVE;
+     }
+   else
+     {
+-      again = callback (user_data);
++      again = g_callback_call_b_p ((gpointer) callback, user_data);
+     }
+ 
+   TRACE (GLIB_IDLE_DISPATCH (source, source->context, callback, user_data, again));

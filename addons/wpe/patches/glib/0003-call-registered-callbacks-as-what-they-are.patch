@@ -1,0 +1,260 @@
+Call dynamically registered callbacks as what they are: WebAssembly checks the type of every call
+through a pointer, and C code commonly registers a function of another type than the one called
+(a GDestroyNotify as a GClosureNotify or GWeakNotify, a signal handler or GAsyncReadyCallback that
+leaves out its last parameters). On wasm, closure notifiers, weak and toggle notifies and GTask's
+callback go through ffi_wasm_call (the wpe add-on's libffi reads the function's real signature
+from the program's table), every signal uses the generic (libffi) marshaller, and the closure
+source's ref/unref become functions of the type they are called as.
+
+diff -ruN glibtest/gio/gtask.c glibtest3/gio/gtask.c
+--- a/gio/gtask.c	2026-10-03 23:17:54.468349324 +0000
++++ b/gio/gtask.c	2026-10-03 23:34:58.886732832 +0000
+@@ -19,6 +19,10 @@
+  */
+ 
+ #include "config.h"
++
++#ifdef __wasm__
++#include <ffi.h>
++#endif
+ #include "gio_trace.h"
+ 
+ #include "gtask.h"
+@@ -1361,9 +1365,21 @@
+ 
+   if (task->callback != NULL)
+     {
++#ifdef __wasm__
++      {
++        /* through libffi, as what the callback really is (WebAssembly checks the type of a call
++         * through a pointer; a callback leaving out parameters is fine in C elsewhere) */
++        GObject *source = task->source_object;
++        GAsyncResult *result = G_ASYNC_RESULT (task);
++        gpointer data = task->callback_data;
++        void *args[3] = { &source, &result, &data };
++        ffi_wasm_call ((void (*) (void)) task->callback, "v_iii", NULL, args);
++      }
++#else
+       task->callback (task->source_object,
+                       G_ASYNC_RESULT (task),
+                       task->callback_data);
++#endif
+     }
+ 
+   task->completed = TRUE;
+diff -ruN glibtest/gobject/gclosure.c glibtest3/gobject/gclosure.c
+--- a/gobject/gclosure.c	2026-10-03 23:17:41.511486733 +0000
++++ b/gobject/gclosure.c	2026-10-03 23:34:58.880410297 +0000
+@@ -256,6 +256,23 @@
+   return closure;
+ }
+ 
++/* WebAssembly checks the type of every call through a pointer, and what is called here often
++ * has another (a GDestroyNotify given as a GClosureNotify, a handler that leaves out its last
++ * parameters): on wasm the call goes through ffi_wasm_call (the add-on's libffi), which calls the
++ * function as what it really is. */
++static inline void
++closure_call_notify (GClosureNotify notify,
++                     gpointer       data,
++                     GClosure      *closure)
++{
++#ifdef __wasm__
++  void *args[2] = { &data, &closure };
++  ffi_wasm_call ((void (*) (void)) notify, "v_ii", NULL, args);
++#else
++  notify (data, closure);
++#endif
++}
++
+ static inline void
+ closure_invoke_notifiers (GClosure *closure,
+ 			  guint     notify_type)
+@@ -290,7 +307,7 @@
+ 	  ndata = closure->notifiers + CLOSURE_N_MFUNCS (closure) + n;
+ 	  closure->marshal = (GClosureMarshal) ndata->notify;
+ 	  closure->data = ndata->data;
+-	  ndata->notify (ndata->data, closure);
++	  closure_call_notify (ndata->notify, ndata->data, closure);
+ 	}
+       closure->marshal = NULL;
+       closure->data = NULL;
+@@ -305,7 +322,7 @@
+ 	  ndata = closure->notifiers + CLOSURE_N_MFUNCS (closure) + closure->n_fnotifiers + n;
+ 	  closure->marshal = (GClosureMarshal) ndata->notify;
+ 	  closure->data = ndata->data;
+-	  ndata->notify (ndata->data, closure);
++	  closure_call_notify (ndata->notify, ndata->data, closure);
+ 	}
+       closure->marshal = NULL;
+       closure->data = NULL;
+@@ -317,7 +334,7 @@
+       while (i--)
+ 	{
+ 	  ndata = closure->notifiers + offs + i;
+-	  ndata->notify (ndata->data, closure);
++	  closure_call_notify (ndata->notify, ndata->data, closure);
+ 	}
+       break;
+     case POST_NOTIFY:
+@@ -326,7 +343,7 @@
+       while (i--)
+ 	{
+ 	  ndata = closure->notifiers + offs + i;
+-	  ndata->notify (ndata->data, closure);
++	  closure_call_notify (ndata->notify, ndata->data, closure);
+ 	}
+       break;
+     }
+diff -ruN glibtest/gobject/gobject.c glibtest3/gobject/gobject.c
+--- a/gobject/gobject.c	2026-10-03 23:17:54.469483813 +0000
++++ b/gobject/gobject.c	2026-10-03 23:34:58.886055967 +0000
+@@ -23,6 +23,10 @@
+ 
+ #include "config.h"
+ 
++#ifdef __wasm__
++#include <ffi.h>
++#endif
++
+ #include <signal.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -66,6 +70,37 @@
+  */
+ 
+ /* --- macros --- */
++
++/* WebAssembly checks the type of every call through a pointer, and what is called here often
++ * has another (a GDestroyNotify given as a GClosureNotify, a handler that leaves out its last
++ * parameters): on wasm the call goes through ffi_wasm_call (the add-on's libffi), which calls the
++ * function as what it really is. */
++static inline void
++object_call_weak_notify (GWeakNotify notify,
++                         gpointer    data,
++                         GObject    *object)
++{
++#ifdef __wasm__
++  void *args[2] = { &data, &object };
++  ffi_wasm_call ((void (*) (void)) notify, "v_ii", NULL, args);
++#else
++  notify (data, object);
++#endif
++}
++
++static inline void
++object_call_toggle_notify (GToggleNotify notify,
++                           gpointer      data,
++                           GObject      *object,
++                           gboolean      is_last_ref)
++{
++#ifdef __wasm__
++  void *args[3] = { &data, &object, &is_last_ref };
++  ffi_wasm_call ((void (*) (void)) notify, "v_iii", NULL, args);
++#else
++  notify (data, object, is_last_ref);
++#endif
++}
+ #define PARAM_SPEC_PARAM_ID(pspec)		((pspec)->param_id)
+ #define	PARAM_SPEC_SET_PARAM_ID(pspec, id)	((pspec)->param_id = (id))
+ 
+@@ -4070,7 +4105,7 @@
+                                          &wdata))
+         break;
+ 
+-      wdata.tuple.notify (wdata.tuple.data, object);
++      object_call_weak_notify (wdata.tuple.notify, wdata.tuple.data, object);
+ 
+       if (wdata.release_all_done)
+         break;
+@@ -4666,7 +4701,7 @@
+   object = object_ref (object, &toggle_notify, &toggle_data);
+ 
+   if (toggle_notify)
+-    toggle_notify (toggle_data, object, FALSE);
++    object_call_toggle_notify (toggle_notify, toggle_data, object, FALSE);
+ 
+   return object;
+ }
+@@ -4800,7 +4835,7 @@
+       /* Beware: object might be a dangling pointer. */
+       TRACE (GOBJECT_OBJECT_UNREF (object, obj_gtype, old_ref));
+       if (toggle_notify)
+-        toggle_notify (toggle_data, object, TRUE);
++        object_call_toggle_notify (toggle_notify, toggle_data, object, TRUE);
+       return;
+     }
+ 
+@@ -4891,7 +4926,7 @@
+       /* Beware: object might be a dangling pointer. */
+       TRACE (GOBJECT_OBJECT_UNREF (object, obj_gtype, old_ref));
+       if (toggle_notify)
+-        toggle_notify (toggle_data, object, TRUE);
++        object_call_toggle_notify (toggle_notify, toggle_data, object, TRUE);
+       return;
+     }
+ 
+@@ -6285,7 +6320,7 @@
+     }
+ 
+   if (toggle_notify)
+-    toggle_notify (toggle_data, object, FALSE);
++    object_call_toggle_notify (toggle_notify, toggle_data, object, FALSE);
+ 
+   return object;
+ }
+diff -ruN glibtest/gobject/gsignal.c glibtest3/gobject/gsignal.c
+--- a/gobject/gsignal.c	2026-10-03 23:17:41.521236840 +0000
++++ b/gobject/gsignal.c	2026-10-03 23:34:58.886488628 +0000
+@@ -1778,6 +1778,13 @@
+       ADD_CHECK (VARIANT)
+     }
+ 
++#ifdef __wasm__
++  /* WebAssembly checks the type of every call through a pointer: a handler that leaves out its
++   * last parameters (fine in C elsewhere) would trap in a specific marshaller. The generic one
++   * calls through libffi, which calls the handler as what it really is (ffi_wasm_call). */
++  c_marshaller = NULL;
++  builtin_c_marshaller = NULL;
++#endif
+   if (c_marshaller == NULL)
+     {
+       if (builtin_c_marshaller)
+@@ -1829,6 +1836,9 @@
+   
+   g_return_if_fail (signal_id > 0);
+   g_return_if_fail (va_marshaller != NULL);
++#ifdef __wasm__
++  return; /* the generic one stays (see g_signal_newv) */
++#endif
+   
+   SIGNAL_LOCK ();
+   node = LOOKUP_SIGNAL_NODE (signal_id);
+diff -ruN glibtest/gobject/gsourceclosure.c glibtest3/gobject/gsourceclosure.c
+--- a/gobject/gsourceclosure.c	2026-10-03 23:17:41.522320186 +0000
++++ b/gobject/gsourceclosure.c	2026-10-03 23:34:58.886525958 +0000
+@@ -220,9 +220,23 @@
+   *data = cb_data;
+ }
+ 
++/* called as void (*) (gpointer): g_closure_ref itself returns the closure, which a call through a
++ * pointer of that type cannot take on WebAssembly */
++static void
++closure_callback_ref (gpointer cb_data)
++{
++  g_closure_ref (cb_data);
++}
++
++static void
++closure_callback_unref (gpointer cb_data)
++{
++  g_closure_unref (cb_data);
++}
++
+ static GSourceCallbackFuncs closure_callback_funcs = {
+-  (void (*) (gpointer)) g_closure_ref,
+-  (void (*) (gpointer)) g_closure_unref,
++  closure_callback_ref,
++  closure_callback_unref,
+   closure_callback_get
+ };
+ 

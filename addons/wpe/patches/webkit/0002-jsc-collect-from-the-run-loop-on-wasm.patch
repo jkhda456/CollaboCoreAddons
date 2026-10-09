@@ -1,0 +1,141 @@
+diff --git a/Source/JavaScriptCore/heap/Heap.cpp b/Source/JavaScriptCore/heap/Heap.cpp
+index 67e317d5..e54b0d21 100644
+--- a/Source/JavaScriptCore/heap/Heap.cpp
++++ b/Source/JavaScriptCore/heap/Heap.cpp
+@@ -115,6 +115,13 @@
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/Threading.h>
+ 
++#if defined(__wasm__)
++#include "JSLock.h"
++#include <wtf/HashMap.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/RunLoop.h>
++#endif
++
+ #if USE(FOUNDATION)
+ #include <wtf/spi/cocoa/objcSPI.h>
+ #endif
+@@ -130,6 +137,82 @@ static constexpr bool verbose = false;
+ static constexpr bool verboseStop = false;
+ }
+ 
++#if defined(__wasm__)
++// WebAssembly keeps a function's values in its own locals, out of reach of the conservative scan
++// of the stack (only what is in linear memory can be scanned). A collection that starts inside an
++// allocation would miss the cells the C++ frames below hold in locals, and free live objects. So
++// the heap does not collect there: an allocation (or an asynchronous request) that wants a
++// collection starts a zero-delay timer on the mutator's run loop instead, and the collection runs
++// from the timer, with nothing but the run loop below it. Only an allocation that goes far past
++// its budget without the run loop getting a turn collects on the spot (the lesser risk then).
++namespace WasmDeferredCollection {
++
++static constexpr size_t emergencyBytes = 768 * MB;
++
++class Timer : public RefCounted<Timer> {
++public:
++    static Ref<Timer> create(VM& vm) { return adoptRef(*new Timer(vm)); }
++
++    void request(GCRequest request)
++    {
++        if (!m_pending || (request.scope && *request.scope == CollectionScope::Full) || !request.scope)
++            m_scope = request.scope;
++        m_pending = true;
++        if (!m_timer.isActive())
++            m_timer.startOneShot(0_s);
++    }
++
++private:
++    explicit Timer(VM& vm)
++        : m_vm(vm)
++        , m_timer(RunLoop::currentSingleton(), "JSC::WasmDeferredCollection"_s, [this] { fired(); })
++    {
++    }
++
++    void fired()
++    {
++        if (!m_pending)
++            return;
++        m_pending = false;
++        JSLockHolder locker(m_vm);
++        if (m_vm.heap.isDeferred()) {
++            request(GCRequest { m_scope });
++            return;
++        }
++        m_vm.heap.collectSync(GCRequest { m_scope });
++    }
++
++    VM& m_vm;
++    RunLoop::Timer m_timer;
++    std::optional<CollectionScope> m_scope;
++    bool m_pending { false };
++};
++
++static Lock lock;
++static HashMap<JSC::Heap*, RefPtr<Timer>>& timers() WTF_REQUIRES_LOCK(lock)
++{
++    static NeverDestroyed<HashMap<JSC::Heap*, RefPtr<Timer>>> map;
++    return map;
++}
++
++static void request(JSC::Heap& heap, GCRequest gcRequest)
++{
++    Locker locker { lock };
++    RefPtr timer = timers().ensure(&heap, [&] {
++        return RefPtr { Timer::create(heap.vm()) };
++    }).iterator->value;
++    timer->request(gcRequest);
++}
++
++static void forget(JSC::Heap& heap)
++{
++    Locker locker { lock };
++    timers().remove(&heap);
++}
++
++} // namespace WasmDeferredCollection
++#endif
++
+ namespace {
+ 
+ static double maxPauseMS(double thisPauseMS)
+@@ -487,6 +570,9 @@ Heap::Heap(VM& vm, HeapType heapType)
+ 
+ Heap::~Heap()
+ {
++#if defined(__wasm__)
++    WasmDeferredCollection::forget(*this);
++#endif
+     // Scribble m_worldState to make it clear that the heap has already been destroyed if we crash in checkConn
+     m_worldState.store(0xbadbeeffu);
+ 
+@@ -1368,6 +1454,11 @@ void Heap::collectAsync(GCRequest request)
+     if (alreadyRequested)
+         return;
+ 
++#if defined(__wasm__)
++    // from the run loop, not from wherever this was asked (see WasmDeferredCollection)
++    WasmDeferredCollection::request(*this, request);
++    return;
++#endif
+     requestCollection(request);
+ }
+ 
+@@ -2966,6 +3057,17 @@ void Heap::collectIfNecessaryOrDefer(GCDeferralContext* deferralContext)
+     else if (isDeferred())
+         m_didDeferGCWork = true;
+     else {
++#if defined(__wasm__)
++        // Not inside an allocation (see WasmDeferredCollection), unless the run loop has not had a
++        // turn for far too long.
++        if (totalBytesAllocatedThisCycle() < WasmDeferredCollection::emergencyBytes) {
++            WasmDeferredCollection::request(*this, GCRequest { });
++            return;
++        }
++        requestCollection(GCRequest { });
++        stopIfNecessary();
++        return;
++#endif
+         collectAsync();
+         stopIfNecessary(); // This will immediately start the collection if we have the conn.
+     }

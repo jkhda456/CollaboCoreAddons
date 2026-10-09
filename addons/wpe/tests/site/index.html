@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>WPE 시험 페이지</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; background: #fffbe8; }
+  h1 { color: #224; }
+  .box { width: 200px; height: 60px; background: linear-gradient(90deg, #36f, #f63); border-radius: 12px; }
+  #out { font-weight: bold; color: #070; }
+</style></head>
+<body>
+<h1>안녕하세요, WPE</h1>
+<p>This page checks the <em>wpe</em> add-on. 한국어 문장도 보여야 합니다.</p>
+<div class="box"></div>
+<form id="f" onsubmit="event.preventDefault(); document.getElementById('out').textContent = 'hello ' + document.getElementById('name').value + ' / ' + document.getElementById('color').value;">
+  <label>Name <input id="name" name="name" placeholder="your name"></label>
+  <select id="color" name="color"><option value="r">red</option><option value="g">green</option><option value="b">blue</option></select>
+  <button type="submit" id="go">Greet</button>
+</form>
+<p id="out"></p>
+<p><a href="second.html">Second page</a> · <a href="https://example.invalid/">nowhere</a></p>
+<button onclick="document.getElementById('count').textContent = +document.getElementById('count').textContent + 1">Count</button>
+<span id="count">0</span>
+<script>
+  // JavaScript works and allocates (the garbage collector runs from the run loop)
+  let junk = [];
+  for (let i = 0; i < 200000; i++) junk.push({ i, s: 'x' + i });
+  document.title = document.title + ' (' + junk.length + ')';
+  junk = null;
+  window.keys = [];
+  document.addEventListener('keydown', e => window.keys.push(e.key));
+</script>
+</body></html>

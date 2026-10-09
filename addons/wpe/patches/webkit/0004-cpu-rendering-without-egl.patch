@@ -1,0 +1,54 @@
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+index bc66c74b..815c71c5 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+@@ -43,6 +43,7 @@
+ #include <WebCore/LocalFrameView.h>
+ #include <WebCore/Page.h>
+ #include <WebCore/PageOverlayController.h>
++#include <WebCore/PlatformDisplay.h>
+ #include <WebCore/Region.h>
+ #include <WebCore/Settings.h>
+ #include <WebCore/ShareableBitmap.h>
+@@ -119,6 +120,14 @@ void DrawingAreaCoordinatedGraphics::updatePreferences(const WebPreferencesStore
+         WebProcess::singleton().initializePlatformDisplayIfNeeded();
+         WebProcess::singleton().initializeVulkanIfNeeded();
+     }
++#endif
++#if PLATFORM(WPE)
++    // No GL in this process (no EGL library: WebProcessGLib.cpp made no display): pages render on
++    // the CPU, without compositing, into shared memory buffers (NonCompositedFrameRenderer).
++    if (!PlatformDisplay::sharedDisplayIfExists()) {
++        settings.setHardwareAccelerationEnabled(false);
++        settings.setAcceleratedCompositingEnabled(false);
++    }
+ #endif
+     settings.setForceCompositingMode(store.getBoolValueForKey(WebPreferencesKey::forceCompositingModeKey()));
+     // Fixed position elements need to be composited and create stacking contexts
+diff --git a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+index 85bc7f23..c51e38db 100644
+--- a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
++++ b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+@@ -37,6 +37,7 @@
+ #include <WebCore/PlatformRenderTheme.h>
+ #include <WebCore/PlatformScreen.h>
+ #include <WebCore/ProcessCapabilities.h>
++#include <epoxy/egl.h>
+ #include <WebCore/ScreenProperties.h>
+ #include <WebCore/SystemSoundManager.h>
+ 
+@@ -239,7 +240,13 @@ void WebProcess::platformInitializeWebProcess(WebProcessCreationParameters& para
+             initializePlatformDisplayIfNeeded();
+     }
+ #else
+-    initializePlatformDisplayIfNeeded();
++    // Without an EGL library (a system with no GPU, such as the collaboCore WebAssembly guest),
++    // there is no EGL display to make: render on the CPU into shared memory buffers, which is the
++    // transport the UI process always takes.
++    if (!m_rendererBufferTransportMode.contains(RendererBufferTransportMode::Hardware) && !epoxy_has_egl())
++        ProcessCapabilities::setCanUseAcceleratedBuffers(false);
++    else
++        initializePlatformDisplayIfNeeded();
+ #endif
+     initializeVulkanIfNeeded();
+ #endif // PLATFORM(WPE)
