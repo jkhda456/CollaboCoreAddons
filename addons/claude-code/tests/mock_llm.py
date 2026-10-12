@@ -1,7 +1,9 @@
 """A scripted model behind the host request API's wire protocol (COLLABO_BRIDGE=tcp:127.0.0.1:PORT).
 
-POST <scenario> {"turns": [...]} to /__scenario to load a script; each model request takes the next
-turn: {"text": "...", "thinking": "...", "tools": [{"name", "input"}], "delay": s, "slow": s-per-piece,
+POST <scenario> {"turns": [...], "models": [...], "routes": {...}} to /__scenario to load a script;
+"models" is what /models lists (default: mock-model), "routes" maps a path to the JSON it answers
+(a {"by_model": {...}} one answers by the request's "model"), for a local server's own API. Each
+model request takes the next turn: {"text": "...", "thinking": "...", "tools": [{"name", "input"}], "delay": s, "slow": s-per-piece,
 "usage": {"input_tokens": n}}. Both /v1/messages (Anthropic SSE) and /chat/completions (OpenAI SSE)
 are answered. Requests are appended to requests.jsonl; /__requests returns them.
 """
@@ -9,7 +11,8 @@ import json, socketserver, sys, os, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.environ.get("CLAUDE_TEST_LOG", os.path.join(HERE, "llm-requests.jsonl"))
-state = {"turns": [], "i": 0}
+DEFAULT_MODELS = [{"id": "mock-model"}]
+state = {"turns": [], "i": 0, "models": DEFAULT_MODELS, "routes": {}}
 lock = threading.Lock()
 
 def chunk(b): return f"{len(b):x}\n".encode() + b
@@ -71,7 +74,9 @@ class Handler(socketserver.StreamRequestHandler):
         body = self.rfile.read(int(headers.get("content-length", 0)))
         req = json.loads(body) if body else None
         if url.endswith("/__scenario"):
-            with lock: state["turns"] = req["turns"]; state["i"] = 0
+            with lock:
+                state["turns"] = req["turns"]; state["i"] = 0
+                state["models"] = req.get("models", DEFAULT_MODELS); state["routes"] = req.get("routes", {})
             open(LOG, "w").close()
             self.wfile.write(b"200 OK\n\n" + chunk(b"ok") + b"0\nOK\n"); return
         if url.endswith("/mcp"):
@@ -94,8 +99,16 @@ class Handler(socketserver.StreamRequestHandler):
             events = f'event: message\ndata: {json.dumps({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})}\n\n' + \
                      f'event: message\ndata: {json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"content": [{"type": "text", "text": text}]}})}\n\n'
             self.wfile.write(b"200 OK\ncontent-type: text/event-stream\n\n" + chunk(events.encode()) + b"0\nOK\n"); return
+        path = "/" + url.split("://", 1)[-1].split("/", 1)[-1].split("?")[0]
+        if path in state["routes"]:
+            answer = state["routes"][path]
+            if isinstance(answer, dict) and "by_model" in answer:
+                answer = answer["by_model"].get((req or {}).get("model"))
+            if answer is None:
+                self.wfile.write(b"404 Not Found\n\n" + chunk(b"not found") + b"0\nOK\n"); return
+            self.wfile.write(b"200 OK\ncontent-type: application/json\n\n" + chunk(json.dumps(answer).encode()) + b"0\nOK\n"); return
         if url.endswith("/models"):
-            self.wfile.write(b"200 OK\ncontent-type: application/json\n\n" + chunk(json.dumps({"data": [{"id": "mock-model"}]}).encode()) + b"0\nOK\n"); return
+            self.wfile.write(b"200 OK\ncontent-type: application/json\n\n" + chunk(json.dumps({"data": state["models"]}).encode()) + b"0\nOK\n"); return
         if "/messages" in url or "/chat/completions" in url:
             with open(LOG, "a") as f: f.write(json.dumps({"url": url, "headers": headers, "body": req}) + "\n")
             with lock:

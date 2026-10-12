@@ -575,8 +575,140 @@ fn openai_usage(usage: Option<&Value>) -> Usage {
     }
 }
 
+/// A model a server offers, with the context window the server runs it with.
+pub struct Model {
+    pub id: String,
+    /// None when the server does not say.
+    pub context: Option<u64>,
+}
+
 /// The models an OpenAI-compatible server offers (GET /models), in its order.
 pub fn list_models(config: &Config) -> Result<Vec<String>, Error> {
+    Ok(model_entries(config)?.iter().filter_map(entry_id).collect())
+}
+
+/// The first `limit` models, each with the context window the server runs it with, when it says:
+/// in the list itself (vLLM and SGLang max_model_len, OpenRouter and Together context_length, Groq
+/// context_window, Mistral max_context_length, TabbyAPI max_seq_len), or asked of the local
+/// servers that leave it out: llama.cpp's /props, Ollama's /api/ps (loaded models) and /api/show
+/// (a num_ctx parameter), LM Studio's /api/v1/models (loaded instances). What a model was trained
+/// for (n_ctx_train, the GGUF's context_length) is not what the server gives it, and is not used.
+pub fn list_models_with_context(config: &Config, limit: usize) -> Result<Vec<Model>, Error> {
+    let entries = model_entries(config)?;
+    let mut models: Vec<Model> = entries.iter().filter_map(|entry| Some(Model { id: entry_id(entry)?, context: listed_context(entry) })).take(limit).collect();
+    if config.provider == Provider::OpenAi && models.iter().any(|model| model.context.is_none()) {
+        ask_local_server(config, &entries, &mut models);
+    }
+    Ok(models)
+}
+
+fn ask_local_server(config: &Config, entries: &[Value], models: &mut [Model]) {
+    let root = config.base_url.strip_suffix("/v1").unwrap_or(&config.base_url);
+    let get = |path: &str| ask_json(config, "GET", &format!("{root}{path}"), None);
+    // llama.cpp serves one model; the context of its slots is in /props.
+    if entries.iter().any(|entry| entry["owned_by"] == "llamacpp") {
+        if let [model] = models {
+            model.context = model.context.or_else(|| get("/props").as_ref().and_then(llamacpp_context));
+        }
+        return;
+    }
+    // Ollama: a loaded model's context in /api/ps; another's only when its parameters set num_ctx
+    // (else the server's default applies, which it does not tell).
+    if let Some(loaded) = get("/api/ps").as_ref().and_then(ollama_loaded) {
+        for model in models.iter_mut().filter(|model| model.context.is_none()) {
+            model.context = loaded.get(&model.id).copied().or_else(|| {
+                let show = ask_json(config, "POST", &format!("{root}/api/show"), Some(&json!({"model": model.id, "name": model.id})));
+                show.as_ref().and_then(ollama_num_ctx)
+            });
+        }
+        return;
+    }
+    // LM Studio: the context its loaded instances were given.
+    if let Some(loaded) = get("/api/v1/models").as_ref().and_then(lmstudio_loaded) {
+        for model in models.iter_mut().filter(|model| model.context.is_none()) {
+            model.context = loaded.get(&model.id).copied();
+        }
+    }
+}
+
+/// A JSON answer, or None on any failure: these questions are optional.
+fn ask_json(config: &Config, method: &str, url: &str, body: Option<&Value>) -> Option<Value> {
+    let bearer = config.api_key.as_ref().map(|key| format!("Bearer {key}"));
+    let mut headers = vec![("accept", "application/json")];
+    if let Some(bearer) = &bearer {
+        headers.push(("authorization", bearer));
+    }
+    if body.is_some() {
+        headers.push(("content-type", "application/json"));
+    }
+    let body = body.map(Value::to_string).unwrap_or_default();
+    let response = bridge::request(method, url, &headers, body.as_bytes()).ok()?;
+    if response.status >= 400 {
+        return None;
+    }
+    let mut text = String::new();
+    response.body.take(8 * 1024 * 1024).read_to_string(&mut text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn entry_id(entry: &Value) -> Option<String> {
+    entry.get("id").or(entry.get("name")).and_then(Value::as_str).map(str::to_string)
+}
+
+fn positive(value: Option<&Value>) -> Option<u64> {
+    value.and_then(Value::as_u64).filter(|&n| n > 0)
+}
+
+fn listed_context(entry: &Value) -> Option<u64> {
+    ["/max_model_len", "/context_length", "/context_window", "/max_context_length", "/max_input_tokens", "/top_provider/context_length", "/parameters/max_seq_len"]
+        .iter()
+        .find_map(|pointer| positive(entry.pointer(pointer)))
+}
+
+fn llamacpp_context(props: &Value) -> Option<u64> {
+    positive(props.pointer("/default_generation_settings/n_ctx")).or_else(|| positive(props.get("n_ctx")))
+}
+
+fn ollama_loaded(ps: &Value) -> Option<std::collections::HashMap<String, u64>> {
+    let mut loaded = std::collections::HashMap::new();
+    for model in ps.get("models")?.as_array()? {
+        if let Some(context) = positive(model.get("context_length")) {
+            for key in ["name", "model"] {
+                if let Some(name) = model[key].as_str() {
+                    loaded.insert(name.to_string(), context);
+                }
+            }
+        }
+    }
+    Some(loaded)
+}
+
+fn ollama_num_ctx(show: &Value) -> Option<u64> {
+    let parameters = show.get("parameters")?.as_str()?;
+    parameters.lines().find_map(|line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+        ["num_ctx", value, ..] => value.parse().ok().filter(|&n: &u64| n > 0),
+        _ => None,
+    })
+}
+
+fn lmstudio_loaded(list: &Value) -> Option<std::collections::HashMap<String, u64>> {
+    let mut loaded = std::collections::HashMap::new();
+    for model in list.get("models")?.as_array()? {
+        for instance in model["loaded_instances"].as_array().into_iter().flatten() {
+            if let Some(context) = positive(instance.pointer("/config/context_length")) {
+                if let Some(id) = instance["id"].as_str() {
+                    loaded.insert(id.to_string(), context);
+                }
+                if let Some(key) = model["key"].as_str() {
+                    loaded.entry(key.to_string()).or_insert(context);
+                }
+            }
+        }
+    }
+    Some(loaded)
+}
+
+fn model_entries(config: &Config) -> Result<Vec<Value>, Error> {
     let bearer = config.api_key.as_ref().map(|key| format!("Bearer {key}"));
     let mut headers = vec![("accept", "application/json")];
     if let Some(bearer) = &bearer {
@@ -601,11 +733,7 @@ pub fn list_models(config: &Config) -> Result<Vec<String>, Error> {
     }
     let value: Value = serde_json::from_str(&body).map_err(|error| Error::fatal(format!("unreadable model list: {error}")))?;
     // OpenAI: {"data": [{"id"}]}; Ollama's native list has {"models": [{"name"}]}.
-    let list = value.get("data").or(value.get("models")).and_then(Value::as_array).cloned().unwrap_or_default();
-    Ok(list
-        .iter()
-        .filter_map(|model| model.get("id").or(model.get("name")).and_then(Value::as_str).map(str::to_string))
-        .collect())
+    Ok(value.get("data").or(value.get("models")).and_then(Value::as_array).cloned().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -646,6 +774,25 @@ mod tests {
         assert_eq!(content[1]["input"], json!({"file_path": "/a"}));
         assert_eq!(content[2]["input"], json!({"__invalid_arguments": "not json"}));
         assert!(content[2]["id"].as_str().unwrap().starts_with("call_1_"));
+    }
+
+    #[test]
+    fn context_windows_servers_tell() {
+        assert_eq!(listed_context(&json!({"id": "m", "max_model_len": 8192})), Some(8192));
+        assert_eq!(listed_context(&json!({"id": "m", "top_provider": {"context_length": 131072}})), Some(131072));
+        assert_eq!(listed_context(&json!({"id": "m", "owned_by": "llamacpp", "meta": {"n_ctx_train": 131072}})), None);
+        assert_eq!(llamacpp_context(&json!({"default_generation_settings": {"n_ctx": 4096}, "total_slots": 1})), Some(4096));
+        let loaded = ollama_loaded(&json!({"models": [{"name": "qwen3:8b", "model": "qwen3:8b", "context_length": 16384}, {"name": "old:1b"}]})).unwrap();
+        assert_eq!((loaded.get("qwen3:8b"), loaded.get("old:1b")), (Some(&16384), None));
+        assert!(ollama_loaded(&json!({"error": "404 page not found"})).is_none());
+        assert_eq!(ollama_num_ctx(&json!({"parameters": "stop                           \"<|im_end|>\"\nnum_ctx                        8192"})), Some(8192));
+        assert_eq!(ollama_num_ctx(&json!({"parameters": "temperature 0.7"})), None);
+        let loaded = lmstudio_loaded(&json!({"models": [
+            {"key": "google/gemma", "max_context_length": 262144, "loaded_instances": [{"id": "google/gemma:2", "config": {"context_length": 4096}}]},
+            {"key": "not/loaded", "max_context_length": 32768, "loaded_instances": []},
+        ]}))
+        .unwrap();
+        assert_eq!((loaded.get("google/gemma"), loaded.get("google/gemma:2"), loaded.get("not/loaded")), (Some(&4096), Some(&4096), None));
     }
 
     #[test]

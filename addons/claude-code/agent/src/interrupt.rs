@@ -11,6 +11,8 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static MAIN_THREAD: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static BACKGROUND: AtomicBool = AtomicBool::new(false);
+static STREAMING: AtomicBool = AtomicBool::new(false);
+static SEND_NOW: AtomicBool = AtomicBool::new(false);
 
 /// Ctrl-B while a command runs: move it to the background.
 pub fn request_background() {
@@ -19,6 +21,28 @@ pub fn request_background() {
 
 pub fn take_background() -> bool {
     BACKGROUND.swap(false, Ordering::SeqCst)
+}
+
+/// The main conversation's answer is streaming (not a tool, not a sub-agent's answer).
+pub fn set_streaming(on: bool) {
+    STREAMING.store(on, Ordering::SeqCst);
+}
+
+/// Send now (Ctrl+Enter, Ctrl+X Ctrl+S): the queued messages go to the model at once. An answer
+/// being streamed is cut short and they follow it as the next prompt; a command running in the
+/// foreground moves to the background and they go with its result.
+pub fn send_now() {
+    SEND_NOW.store(true, Ordering::SeqCst);
+    if STREAMING.load(Ordering::SeqCst) {
+        trigger();
+    } else {
+        request_background();
+    }
+}
+
+/// Takes the send-now request: true once per request.
+pub fn take_send_now() -> bool {
+    SEND_NOW.swap(false, Ordering::SeqCst)
 }
 
 extern "C" fn on_sigint(_: libc::c_int) {

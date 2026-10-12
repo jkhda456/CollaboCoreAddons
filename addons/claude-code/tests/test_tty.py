@@ -1,5 +1,5 @@
 """Interactive checks: claude in a pseudo-terminal against mock_llm.py (18090)."""
-import json, os, shutil, socket, subprocess, sys, tempfile, time
+import json, os, re, shutil, socket, subprocess, sys, tempfile, time
 S = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, S)
 import ptydrive
 from ptydrive import plain
@@ -10,8 +10,8 @@ fails = []
 def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + ("" if ok else f"\n     {str(detail)[-1500:]}"))
     if not ok: fails.append(name)
-def scenario(turns):
-    body = json.dumps({"turns": turns}).encode()
+def scenario(turns, **server):
+    body = json.dumps({"turns": turns, **server}).encode()
     s = socket.create_connection(("127.0.0.1", 18090)); s.sendall(b"POST http://x/__scenario\ncontent-length: %d\n\n" % len(body) + body); s.recv(100); s.close()
 def requests():
     return [json.loads(l) for l in open(LOG)] if os.path.exists(LOG) else []
@@ -36,6 +36,7 @@ try:
     out = t.expect("Welcome to Claude Code", 15)
     t.expect(r"for shortcuts", 5)
     check("welcome box says it is the WASM port", "WASM native port for CollaboCore" in plain(t.all.decode(errors="replace")), plain(t.all.decode(errors="replace"))[:800])
+    check("welcome box gives the context window, here the default", "context window: 200,000 tokens (default · contextWindow sets it)" in plain(t.all.decode(errors="replace")), plain(t.all.decode(errors="replace"))[:1200])
     check("status line from the settings' command", "STATUS-permission_mode" in plain(t.all.decode(errors="replace")), plain(t.all.decode(errors="replace"))[-400:])
 
     t.send("/he"); out = t.expect("Show help", 5)
@@ -46,8 +47,10 @@ try:
     t.send("\x1b[Z"); out = t.expect("accept edits on", 5)
     check("shift+tab: accept edits", True)
     t.send("\x1b[Z"); t.expect("plan mode on", 5)
+    t.send("\x1b[Z"); t.expect("bypass permissions on", 5)
+    check("shift+tab reaches bypass without --dangerously-skip-permissions", True)
     t.send("\x1b[Z"); t.read(0.5)
-    check("shift+tab cycles back to default", "plan mode on" not in plain(t.buf.decode(errors="replace"))[-300:])
+    check("shift+tab cycles back to default", "bypass permissions on" not in plain(t.buf.decode(errors="replace"))[-300:])
 
     # Permission dialog; "don't ask again" writes the rule.
     scenario([{"tools": [{"name": "Bash", "input": {"command": "touch made.txt", "description": "Make a file"}}]}, {"text": "Made it."}])
@@ -107,9 +110,9 @@ try:
     t.read(0.3)
 
     # While Claude works: the input box stays, Enter queues, Shift+Tab changes the mode at once.
+    # The queued message is read with the results of the step that was running.
     scenario([
         {"delay": 2.0, "tools": [{"name": "Write", "input": {"file_path": "live.txt", "content": "written without asking"}}]},
-        {"text": "wrote it"},
         {"text": "got the queued one"},
     ])
     t.send("write a file\r"); t.expect("esc to interrupt", 10)
@@ -121,9 +124,20 @@ try:
     t.expect("got the queued one", 20)
     check("the mode applied to the next tool (no dialog)", open(os.path.join(proj, "live.txt")).read() == "written without asking" and "Do you want to make this edit" not in plain(t.all.decode(errors="replace"))[-3000:])
     last_prompt = requests()[-1]["body"]["messages"][-1]["content"]
-    check("the queued message is sent after the turn", any(b.get("text") == "queued question" for b in last_prompt), last_prompt)
+    check("the queued message is read with the tool's result", any(b.get("type") == "tool_result" for b in last_prompt) and any("while you were working:\nqueued question" in b.get("text", "") for b in last_prompt), last_prompt)
     t.expect("accept edits on", 5)
-    t.send("\x1b[Z\x1b[Z"); t.read(0.5)
+    t.send("\x1b[Z\x1b[Z\x1b[Z"); t.read(0.5)
+
+    # Queued while Claude only answers (no step to read it with): sent after the turn.
+    scenario([{"delay": 1.5, "text": "first answer"}, {"text": "got the second one"}])
+    t.send("first\r")
+    end = time.time() + 10
+    while not requests() and time.time() < end: t.read(0.1)  # the answer is on its way
+    t.send("second question\r"); t.expect(r"second question \(queued\)", 5)
+    t.expect("got the second one", 20)
+    last_prompt = requests()[-1]["body"]["messages"][-1]["content"]
+    check("a message queued during an answer is sent after the turn", any(b.get("text") == "second question" for b in last_prompt), last_prompt)
+    t.expect("for shortcuts", 5)
 
     # ! runs a command; # adds to memory.
     t.send("!echo bang-output\r"); out = t.expect("bang-output", 10)
@@ -314,6 +328,27 @@ try:
     check("approved plan: edits auto-accepted", open(os.path.join(proj, "new.txt")).read() == "planned")
     t.expect("accept edits on", 5)
     check("mode switched to accept edits", True)
+    t.send("\x04")
+finally:
+    t.close()
+
+# An OpenAI-compatible server: /model lists each model with the context the server gives it, when it
+# says: in the list (vLLM), or asked of the server (here Ollama's: /api/ps, /api/show).
+scenario([{"text": "served answer"}], models=[{"id": "served", "max_model_len": 8192}, {"id": "loaded:7b"}, {"id": "show:7b"}, {"id": "quiet"}],
+         routes={"/api/ps": {"models": [{"name": "loaded:7b", "model": "loaded:7b", "context_length": 65536}]},
+                 "/api/show": {"by_model": {"show:7b": {"parameters": "num_ctx 4096"}, "quiet": {"parameters": "temperature 0.7"}}}})
+t = start("--provider", "openai", "--base-url", "http://localhost:11434/v1", "--settings", '{"contextWindow": 16384}')
+try:
+    out = t.expect("for shortcuts", 15)
+    check("welcome box gives the context window and where it is set", "context window: 16,384 tokens (contextWindow in the cli settings)" in plain(out), plain(out)[:1200])
+    t.send("/model\r"); out = plain(t.expect(r"4\. quiet", 10)); t.read(0.3); out += plain(t.buf.decode(errors="replace"))
+    listed = [re.search(pattern, out) for pattern in (r"1\. served\s+context 8,192", r"2\. loaded:7b\s+context 65,536", r"3\. show:7b\s+context 4,096", r"4\. quiet\s+│")]
+    check("/model: each model with the context its server gives it, none when it does not say", all(listed) and "context window 16,384" in out, out[-1500:])
+    t.send("1"); out = plain(t.expect("before it is compacted", 10))
+    check("/model: a model given less context than the window is pointed out", "8,192 tokens of context, fewer than the context window (16,384)" in out and "set contextWindow in /config" in out, out[-600:])
+    t.expect("for shortcuts", 5)
+    t.send("hello\r"); t.expect("served answer", 10)
+    check("/model: the chosen model answers", requests()[-1]["body"]["model"] == "served", requests()[-1]["body"].get("model"))
     t.send("\x04")
 finally:
     t.close()

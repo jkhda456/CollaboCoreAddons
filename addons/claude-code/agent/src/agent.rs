@@ -65,6 +65,11 @@ pub trait Ui {
     fn sync_mode(&mut self, current: Mode) -> Mode {
         current
     }
+    /// Messages the user sent while Claude worked, for the model to read before its next step
+    /// (the interactive terminal's queue); shown in the conversation as they are taken.
+    fn take_queued(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 struct SinkAdapter<'a> {
@@ -727,16 +732,27 @@ impl Session {
                 let lines = finished.iter().map(|(id, command, code)| format!("Background Bash {id} (command: {command}) has completed with exit code {code}. Read its output with BashOutput.")).collect::<Vec<_>>().join("\n");
                 self.push_user(vec![reminder(&lines)], ui);
             }
+            // Messages the user sent meanwhile: read now, with the results of the last step.
+            if self.depth == 0 && self.messages.last().is_some_and(|m| m["role"] == "user") {
+                let queued = ui.take_queued();
+                if !queued.is_empty() {
+                    crate::interrupt::take_send_now();
+                    let blocks = queued.iter().map(|text| reminder(&format!("The user sent the following message while you were working:\n{text}\n\nPlease address this message and continue with your tasks."))).collect();
+                    self.push_user(blocks, ui);
+                }
+            }
 
             let system = self.system_prompt();
             let specs = self.tool_specs();
             ui.begin_request();
             let started = Instant::now();
+            crate::interrupt::set_streaming(self.depth == 0);
             let result = llm::complete(
                 &self.config,
                 &llm::Request { model: &self.model, system: &system, messages: &self.messages, tools: &specs, thinking },
                 &mut SinkAdapter { ui },
             );
+            crate::interrupt::set_streaming(false);
             self.api_time += started.elapsed();
             ui.end_message();
             let turn = match result {

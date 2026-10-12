@@ -456,6 +456,12 @@ fn main() {
         Some(mode) => Mode::parse(&mode).unwrap_or_else(|message| fail(&message)),
         None => Mode::Default,
     };
+    // Bypass is always one Shift+Tab away: the sandbox is the boundary. Settings can take it away
+    // as in Claude Code (permissions.disableBypassPermissionsMode: "disable").
+    let bypass_available = settings.str("/permissions/disableBypassPermissionsMode").as_deref() != Some("disable");
+    if mode == Mode::Bypass && !bypass_available {
+        fail("bypassPermissions mode is disabled by the settings (permissions.disableBypassPermissionsMode)");
+    }
 
     // The conversation: new, the latest (--continue), or one named (--resume).
     session::cleanup(settings.u64("/cleanupPeriodDays").unwrap_or(30));
@@ -523,7 +529,7 @@ fn main() {
         messages,
         context,
         mode,
-        bypass_available: mode == Mode::Bypass,
+        bypass_available,
         rules,
         extra_dirs,
         cli_allow: args.allowed.clone(),

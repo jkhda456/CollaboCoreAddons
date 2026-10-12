@@ -1,13 +1,14 @@
 //! The live panel under the conversation while Claude works: the spinner (a glyph that
 //! breathes, a verb, the time, the tokens, "esc to interrupt", what is happening), messages
-//! queued for after the turn, the input box the user keeps typing in, and the permission mode
-//! (Shift+Tab changes it as Claude works).
+//! queued for Claude (read when the current step ends, or at once with send now), the input box
+//! the user keeps typing in, and the permission mode (Shift+Tab changes it as Claude works).
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::permissions::Mode;
 use crate::term;
+use crate::ui::canvas::{synchronized, Canvas};
 use crate::ui::editor::Key;
 
 const FRAMES: [&str; 10] = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
@@ -20,8 +21,8 @@ const VERBS: [&str; 40] = [
 
 struct State {
     active: bool,
-    /// Lines on screen now (0, 1 or 2).
-    drawn: usize,
+    /// The panel on screen.
+    canvas: Canvas,
     verb: String,
     started: Option<Instant>,
     tokens: u64,
@@ -29,8 +30,6 @@ struct State {
     /// The task in progress (TodoWrite's activeForm), in place of a random verb.
     task: Option<String>,
     frame: usize,
-    /// Rows from the top of the drawing to the row the cursor was left on.
-    cursor_row: usize,
     live: Option<Live>,
     /// The session's todo list (content, status).
     todos: Vec<(String, String)>,
@@ -47,7 +46,18 @@ struct Live {
     mode_changed: bool,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { active: false, drawn: 0, verb: String::new(), started: None, tokens: 0, note: None, task: None, frame: 0, cursor_row: 0, live: None, todos: Vec::new() });
+static STATE: Mutex<State> = Mutex::new(State {
+    active: false,
+    canvas: Canvas::new(),
+    verb: String::new(),
+    started: None,
+    tokens: 0,
+    note: None,
+    task: None,
+    frame: 0,
+    live: None,
+    todos: Vec::new(),
+});
 static THREAD: AtomicBool = AtomicBool::new(false);
 /// Ctrl-T: the todo list under the spinner.
 pub static SHOW_TODOS: AtomicBool = AtomicBool::new(true);
@@ -110,6 +120,7 @@ pub fn toggle_todos() -> bool {
 
 /// The input box and mode for the turn about to run (interactive mode).
 pub fn live_begin(mode: Mode, bypass: bool) {
+    crate::interrupt::take_send_now();
     state().live = Some(Live { buffer: Vec::new(), cursor: 0, queued: Vec::new(), mode, bypass, mode_changed: false });
 }
 
@@ -118,6 +129,16 @@ pub fn live_end() -> Option<(Vec<String>, String, Mode)> {
     let _guard = term::lock();
     erase_locked();
     state().live.take().map(|live| (live.queued, live.buffer.into_iter().collect(), live.mode))
+}
+
+/// The messages queued so far, taken for the model to read now (between two steps of a turn).
+pub fn take_queued() -> Vec<String> {
+    let queued = state().live.as_mut().map(|live| std::mem::take(&mut live.queued)).unwrap_or_default();
+    if !queued.is_empty() {
+        let _guard = term::lock();
+        draw_locked();
+    }
+    queued
 }
 
 /// The session's mode, or the user's if they changed it while Claude worked.
@@ -189,13 +210,26 @@ pub fn live_key(key: Key) {
             live.buffer.drain(start..live.cursor);
             live.cursor = start;
         }
-        Key::Enter => {
+        Key::Enter | Key::SendNow => {
             let text: String = live.buffer.iter().collect();
             if !text.trim().is_empty() {
                 live.queued.push(text.trim_end().to_string());
             }
             live.buffer.clear();
             live.cursor = 0;
+            if key == Key::SendNow && !live.queued.is_empty() {
+                crate::interrupt::send_now();
+            }
+        }
+        // Up on the input's first line: the queued messages come back into it to be edited.
+        Key::Up if !live.queued.is_empty() && !live.buffer[..live.cursor].contains(&'\n') => {
+            let mut text: Vec<char> = live.queued.drain(..).collect::<Vec<_>>().join("\n").chars().collect();
+            live.cursor = text.len();
+            if !live.buffer.is_empty() {
+                text.push('\n');
+            }
+            text.extend(live.buffer.drain(..));
+            live.buffer = text;
         }
         Key::ShiftTab => {
             live.mode = live.mode.next(live.bypass);
@@ -211,17 +245,33 @@ pub fn live_key(key: Key) {
 
 /// Clears the panel; the caller holds the terminal lock.
 pub fn erase_locked() {
-    let mut s = state();
-    if s.drawn > 0 {
-        let mut text = String::from("\r");
-        if s.cursor_row > 0 {
-            text.push_str(&format!("\x1b[{}A", s.cursor_row));
-        }
-        text.push_str("\x1b[J");
+    let text = state().canvas.erase();
+    if !text.is_empty() {
         term::raw(&text);
     }
-    s.drawn = 0;
-    s.cursor_row = 0;
+}
+
+/// `text` written where the panel is, and the panel drawn again under it, in one write: over the
+/// old panel rather than after clearing it, so that it is never seen gone (the terminal shows
+/// what comes as it comes, and the guest's terminal hands the bytes on a line at a time).
+/// The caller holds the terminal lock.
+pub fn around_locked(text: &str) -> String {
+    let mut s = state();
+    if !s.canvas.is_drawn() {
+        return text.to_string();
+    }
+    let columns = term::columns();
+    // Each line over the old panel clears what is left of it.
+    let mut out = s.canvas.to_top();
+    out.push_str(&text.replace("\r\n", "\n").replace('\n', "\x1b[K\n"));
+    s.canvas.forget();
+    if s.active && text.ends_with('\n') {
+        let (lines, cursor) = compose(&s, columns);
+        out.push_str(&s.canvas.fresh(lines, cursor, columns));
+    } else {
+        out.push_str("\x1b[J");
+    }
+    synchronized(&out)
 }
 
 /// The input text wrapped to `width` columns, and the cursor's (row, column) in it.
@@ -257,13 +307,25 @@ fn draw_locked() {
         return;
     }
     s.frame = (s.frame + 1) % FRAMES.len();
+    let columns = term::columns();
+    let (lines, cursor) = compose(&s, columns);
+    // About once a second every line again, in case something else wrote over the panel.
+    let every = s.frame == 0;
+    let text = s.canvas.draw(lines, cursor, columns, every);
+    drop(s);
+    if !text.is_empty() {
+        term::raw(&synchronized(&text));
+    }
+}
+
+/// The panel's lines, and where the cursor goes in them (row, column).
+fn compose(s: &State, columns: usize) -> (Vec<String>, (usize, usize)) {
     let elapsed = s.started.map(|t| t.elapsed()).unwrap_or_default();
     let mut detail = vec![crate::util::duration(elapsed)];
     if s.tokens > 0 {
         detail.push(format!("↓ {} tokens", crate::util::tokens(s.tokens)));
     }
     detail.push("esc to interrupt".into());
-    let columns = term::columns();
     let verb = s.task.clone().unwrap_or_else(|| s.verb.clone());
     let line = term::truncate(&format!("{} {}… ({})", FRAMES[s.frame], verb, detail.join(" · ")), columns - 1);
     let (glyph_and_verb, rest) = line.split_once(" (").map(|(a, b)| (a.to_string(), format!(" ({b}"))).unwrap_or((line.clone(), String::new()));
@@ -300,38 +362,56 @@ fn draw_locked() {
         lines.push(term::dim(&format!("╰{}╯", "─".repeat(columns.saturating_sub(2)))));
         let footer = match live.mode.banner() {
             Some(banner) => {
-                let text = format!("  {banner} (shift+tab to cycle)");
+                let text = term::truncate(&format!("  {banner} (shift+tab to cycle)"), columns - 1);
                 match live.mode {
                     Mode::Plan => term::cyan(&text),
                     Mode::Bypass => term::red(&text),
                     _ => term::magenta(&text),
                 }
             }
-            None => term::dim(if live.queued.is_empty() { "  enter to queue a message · shift+tab to change mode" } else { "  queued messages are sent when Claude is done" }),
+            None => term::dim(&term::truncate(
+                if live.queued.is_empty() { "  enter to queue a message · shift+tab to change mode" } else { "  queued: Claude reads them after this step · ctrl+x ctrl+s to send now · ↑ to edit" },
+                columns - 1,
+            )),
         };
         lines.push(footer);
         cursor = Some((top + row, 4 + col));
     }
-    let mut text = lines.join("\r\n");
+    // Without the input box the cursor rests after the last line.
     let last = lines.len() - 1;
-    let cursor_row = match cursor {
-        Some((row, col)) => {
-            if last > row {
-                text.push_str(&format!("\x1b[{}A", last - row));
-            }
-            text.push_str(&format!("\r\x1b[{col}C"));
-            row
-        }
-        None => last,
-    };
-    // Replace the previous drawing in one write, to keep the flicker down.
-    let erase = match (s.drawn, s.cursor_row) {
-        (0, _) => String::new(),
-        (_, 0) => "\r\x1b[J".to_string(),
-        (_, up) => format!("\r\x1b[{up}A\x1b[J"),
-    };
-    s.drawn = lines.len();
-    s.cursor_row = cursor_row;
-    drop(s);
-    term::raw(&format!("{erase}{text}"));
+    let cursor = cursor.unwrap_or((last, term::width(&lines[last])));
+    (lines, cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn typed(text: &str) {
+        text.chars().for_each(|c| live_key(Key::Char(c)));
+    }
+
+    #[test]
+    fn queue() {
+        live_begin(Mode::Default, false);
+        typed("one");
+        live_key(Key::Enter);
+        typed("two");
+        live_key(Key::Enter);
+        // Up brings the queued messages back into the input box, before what is being typed.
+        typed("three");
+        live_key(Key::Home);
+        live_key(Key::Up);
+        assert!(take_queued().is_empty());
+        live_key(Key::End);
+        live_key(Key::Enter);
+        typed("four");
+        live_key(Key::Enter);
+        assert_eq!(take_queued(), ["one\ntwo\nthree", "four"]);
+        assert!(take_queued().is_empty());
+        typed("draft");
+        let (queued, draft, _) = live_end().unwrap();
+        assert!(queued.is_empty());
+        assert_eq!(draft, "draft");
+    }
 }

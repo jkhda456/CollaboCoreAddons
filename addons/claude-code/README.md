@@ -18,13 +18,13 @@ guest's WebAssembly kernel; this is its own code, following Claude Code's behavi
 |---|---|
 | Tools | Task (sub-agents), Bash (+ `run_in_background`, BashOutput, KillShell), Read (text, images, notebooks), Write, Edit, MultiEdit, NotebookEdit, LS, Glob, Grep (`-A/-B/-C`, `-n`, `-i`, type, multiline), WebFetch, WebSearch (Anthropic's server tool), TodoWrite, ExitPlanMode, MCP tools (`mcp__server__tool`) |
 | Turn processing | streaming answers, extended thinking (`think` / `think hard` / `ultrathink`, Tab, `alwaysThinkingEnabled`), `@file` attachments, read-before-edit checks, background-shell completion notices, auto-compaction near the context window and `/compact`, retries with backoff, Esc / Ctrl-C interruption of the answer or the running command |
-| Permissions | modes `default`, `acceptEdits`, `plan`, `bypassPermissions` (Shift+Tab cycles); `permissions.{allow,ask,deny}` rules like `Bash(npm run:*)`, `Read(./src/**)`, `Edit(//etc/**)`, `WebFetch(domain:x)`, `mcp__server`; read-only commands run without asking; the dialog's "don't ask again" saves a rule to `.claude/settings.local.json`; `--allowedTools` / `--disallowedTools`; `additionalDirectories` / `--add-dir` |
+| Permissions | modes `default`, `acceptEdits`, `plan`, `bypassPermissions` (Shift+Tab cycles through all four, bypass included without `--dangerously-skip-permissions`: the sandbox is the boundary; `permissions.disableBypassPermissionsMode: "disable"` takes bypass away, as in Claude Code); `permissions.{allow,ask,deny}` rules like `Bash(npm run:*)`, `Read(./src/**)`, `Edit(//etc/**)`, `WebFetch(domain:x)`, `mcp__server`; read-only commands run without asking; the dialog's "don't ask again" saves a rule to `.claude/settings.local.json`; `--allowedTools` / `--disallowedTools`; `additionalDirectories` / `--add-dir` |
 | Settings | `~/.claude/settings.json`, `.claude/settings.json`, `.claude/settings.local.json`, `--settings`, plus what the app gave at start; `env`, `model`, `hooks`, `statusLine`, `outputStyle`, `cleanupPeriodDays`, `autoCompactEnabled`, `preferredNotifChannel`, … |
 | Hooks | PreToolUse, PostToolUse, UserPromptSubmit, Stop, SubagentStop, SessionStart, SessionEnd, Notification, PreCompact; JSON on stdin; exit 2 blocks; JSON output (`decision`, `permissionDecision`, `additionalContext`, `updatedInput`, `continue`, `systemMessage`) |
 | Memory | `CLAUDE.md` from `~/.claude` and each directory down to the working one (`AGENTS.md` where there is no `CLAUDE.md`), `CLAUDE.local.md`, `@path` imports; `#note` adds to one; `/memory` opens one in `$EDITOR`; `/init` writes one |
 | Extensions | sub-agents in `.claude/agents/*.md` (+ built-in `general-purpose`, `Explore`); slash commands in `.claude/commands/**/*.md` (`$ARGUMENTS`, `$1`…, ``!`cmd` ``, `allowed-tools`, `model`); output styles (Default, Explanatory, Learning, `.claude/output-styles/*.md`); MCP servers (stdio in the guest, streamable HTTP through the host) from `.mcp.json`, settings or `--mcp-config` |
 | Sessions | transcripts in `~/.claude/projects/…/<id>.jsonl`; `--continue`, `--resume [id]`, `/resume`, `/export` |
-| Terminal | welcome box, bordered input box (multi-line, wide characters, history, bracketed paste, `/` command menu, `@` path completion, `!` bash mode, `#` memory mode, Esc Esc to clear, Ctrl-C twice to leave), the spinner (verb, time, tokens, the task in progress, a command's latest output), Markdown rendering as it streams, numbered colored diffs, todo checklists, permission and plan dialogs, status line, while Claude works the input box stays: type the next message (Enter queues it, sent when the turn ends), Shift+Tab switches the mode for the next tool call, Esc interrupts; terminal bell |
+| Terminal | welcome box, bordered input box (multi-line, wide characters, history, bracketed paste, `/` command menu, `@` path completion, `!` bash mode, `#` memory mode, Esc Esc to clear, Ctrl-C twice to leave), the spinner (verb, time, tokens, the task in progress, a command's latest output), Markdown rendering as it streams, numbered colored diffs, todo checklists, permission and plan dialogs, status line, while Claude works the input box stays: type the next message (Enter queues it; Claude reads it when the current step ends, or at once with Ctrl+Enter / Ctrl+X Ctrl+S, which cuts a streaming answer short or moves a running command to the background; ↑ brings queued messages back to edit), Shift+Tab switches the mode for the next tool call, Esc interrupts; terminal bell |
 | Working longer | `/goal CONDITION` (Claude keeps going until a check says the condition holds), `/loop [interval] PROMPT`, checkpoints with `/rewind` or Esc Esc (restore the conversation, the code, or both), Ctrl+B to move a running command to the background, `/tasks` |
 | Plugins | marketplaces (`/plugin marketplace add PATH-or-GIT-URL`), `/plugin install NAME@MARKETPLACE`, enable / disable / uninstall, `--plugin-dir`, `claude plugin …`; a plugin's commands (`/plugin:command`), agents, skills, hooks (with `if` rules and `asyncRewake`) and MCP servers. TypeScript "mods" need a JavaScript engine and are not supported |
 | Skills | `.claude/skills/NAME/SKILL.md` (and `~/.claude/skills`, plugins): Claude loads one with the Skill tool when a request fits; `/NAME` loads one yourself; `/skills` lists them |
@@ -32,7 +32,7 @@ guest's WebAssembly kernel; this is its own code, following Claude Code's behavi
 
 `/config` opens the settings panel (↑↓ to move, Enter/Space/←→ to change, Delete to reset, Tab for the file changes go to: local, project or user); `/config show` prints the settings, `/config set KEY VALUE` sets one.
 
-Keys: Ctrl+R searches the history, Ctrl+O shows verbose output, Ctrl+T the todo list, Ctrl+B backgrounds a running command, Esc Esc rewinds; `/vim` gives the input box vim keys; `/theme` picks colors; `/copy` copies the last answer (OSC 52).
+Keys: Ctrl+X Ctrl+S (or Ctrl+Enter) sends queued messages now, Ctrl+R searches the history, Ctrl+O shows verbose output, Ctrl+T the todo list, Ctrl+B backgrounds a running command, Esc Esc rewinds; `/vim` gives the input box vim keys; `/theme` picks colors; `/copy` copies the last answer (OSC 52).
 
 Slash commands: `/add-dir /agents /bashes /clear /compact /config /context /cost /doctor /exit /export
 /help /hooks /init /login /logout /mcp /memory /model /output-style /permissions /quit /release-notes
@@ -69,7 +69,7 @@ lowest settings layer:
 | `model` | the model (or an alias) | `claude-opus-5-5` / the first one the server lists |
 | `apiKey` | becomes a host-side secret for `baseUrl`'s host (https); a plain-http `baseUrl` gets it in the guest | none |
 | `maxTokens` | longest answer | 32000 / the server's default |
-| `contextWindow` | when to compact | 200000 / 32768 |
+| `contextWindow` | the tokens the model takes in: the conversation is compacted before it fills. A local server often gives a model less than its own maximum, so set this to what the server gives it; the welcome box shows the value in effect and where it comes from, and `/model` lists each model with the context its server gives it (when the server says: vLLM, SGLang, llama.cpp, Ollama for a loaded model or a `num_ctx` parameter, LM Studio for a loaded model, OpenRouter, …) | 200000 / 32768 |
 | `stream` | streamed answers | `true` |
 | `permissionMode` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (or `allow` / `ask`) | `default` |
 | `appendSystemPrompt`, `maxTurns`, `webSearch`, `alwaysThinkingEnabled`, `maxThinkingTokens` | | |
@@ -124,8 +124,8 @@ JSON result's `permission_denials`) unless rules, `--allowedTools` or the mode a
 
 ## Building and testing
 
-`./build.sh addons` (after `userspace` and `python`, which builds the guest's Rust toolchain), or
-`addons/claude-code/build.sh`; `TEST=1` runs the unit tests natively first. Output:
+`python3 addons/build.py build claude-code` (after `userspace` and `python`, which builds the
+guest's Rust toolchain), or `addons/claude-code/build.sh`; `TEST=1` runs the unit tests natively first. Output:
 `out/claude-code.cpio` (`/usr/bin/claude`) and `out/licenses/crates.txt`.
 
 `tests/run.sh` runs the checks against a scripted model (`tests/mock_llm.py`): the unit tests,
@@ -137,7 +137,7 @@ the guest through the packaged runtime (`tests/run.sh native` for the first half
 | `agent/src/main.rs` | command line, `claude mcp` / `claude config`, `-p` output |
 | `agent/src/agent.rs` | a session: the turn loop, permissions, hooks, sub-agents, compaction |
 | `agent/src/repl.rs` | the interactive session and the slash commands |
-| `agent/src/ui/` | the terminal (`terminal.rs`), the input box (`editor.rs`), the spinner, `-p` output |
+| `agent/src/ui/` | the terminal (`terminal.rs`), the input box (`editor.rs`), the spinner (`spinner.rs`), the `/config` panel, `-p` output; what is redrawn as things change (the spinner's panel, the input box as one types, dialogs, the `/config` panel) goes through `canvas.rs`: redrawn in place, only the lines that changed, as one synchronized update, never cleared first, because the guest's terminal hands a write on a line at a time and a terminal that shows each piece at once (Windows Terminal through the launcher) showed it blinking; a key typed rewrites the one line it changed |
 | `agent/src/tools/` | the built-in tools |
 | `agent/src/llm.rs` | the two APIs (streamed and not); the conversation is kept as Messages API blocks |
 | `agent/src/settings.rs`, `config.rs`, `permissions.rs`, `hooks.rs` | settings layers, the connection, rules and modes, hooks |

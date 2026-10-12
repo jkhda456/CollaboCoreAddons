@@ -273,15 +273,16 @@ pub fn at_line_start() -> bool {
     AT_LINE_START.load(Ordering::Relaxed)
 }
 
-/// Writes to the terminal; the spinner's line is cleared first, and comes back after.
+/// Writes to the terminal; the spinner's panel makes room, and is drawn again under the text
+/// in the same write.
 pub fn out(text: &str) {
     if text.is_empty() {
         return;
     }
     let _guard = lock();
-    crate::ui::spinner::erase_locked();
+    let framed = crate::ui::spinner::around_locked(text);
     let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.write_all(framed.as_bytes());
     let _ = stdout.flush();
     AT_LINE_START.store(text.ends_with('\n'), Ordering::Relaxed);
 }

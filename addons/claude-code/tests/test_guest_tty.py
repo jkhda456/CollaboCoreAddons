@@ -1,5 +1,5 @@
 """claude's interactive UI inside the guest: the engine in a pseudo-terminal (raw mode)."""
-import json, os, shutil, sys, tempfile, time, urllib.request
+import json, os, re, shutil, sys, tempfile, time, urllib.request
 S = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, S)
 import ptydrive
 from ptydrive import plain
@@ -9,8 +9,8 @@ fails = []
 def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + ("" if ok else f"\n     {str(detail)[-1500:]}"))
     if not ok: fails.append(name)
-def scenario(turns):
-    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18091/__scenario", data=json.dumps({"turns": turns}).encode(), method="POST")).read()
+def scenario(turns, **server):
+    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18091/__scenario", data=json.dumps({"turns": turns, **server}).encode(), method="POST")).read()
 def requests():
     return [json.loads(l) for l in open(LOG)] if os.path.exists(LOG) else []
 
@@ -18,7 +18,8 @@ work = tempfile.mkdtemp(prefix="claude-gtty-")
 open(os.path.join(work, "a.txt"), "w").write("one\n")
 t = ptydrive.Session([f"{RT}/bin/collabo-core-engine", "--kernel", f"{RT}/app/images/vmlinux.wasm", "--initramfs", f"{RT}/app/images/initramfs.cpio",
                       "--addon-dir", f"{RT}/app/images/addons", "--allow-loopback", "--mount", f"{work}:/work", "--arg", "collabo.quiet=1",
-                      "--addon-config", "claude-code:baseUrl=http://localhost:18091", "--addon-config", "claude-code:model=claude-sonnet-5"],
+                      "--addon-config", "claude-code:baseUrl=http://localhost:18091", "--addon-config", "claude-code:model=claude-sonnet-5",
+                      "--addon-config", "claude-code:contextWindow=50000"],
                      cols=110, rows=40, env={"TERM": "xterm-256color"})
 try:
     t.expect(r"# ", 90)
@@ -26,6 +27,7 @@ try:
     t.expect("Welcome to Claude Code", 60)
     t.expect("for shortcuts", 20)
     check("guest: welcome and input box, marked as the WASM port", "WASM native port for CollaboCore" in plain(t.all.decode(errors="replace")))
+    check("guest: welcome box gives the add-on settings' context window", "context window: 50,000 tokens (contextWindow in the addon settings)" in plain(t.all.decode(errors="replace")), plain(t.all.decode(errors="replace"))[-1500:])
 
     t.send("안녕하세요 wide text"); out = t.expect("wide text", 10)
     t.send("\x15"); t.read(0.5)
@@ -62,7 +64,7 @@ try:
     t.expect("for shortcuts", 20)
 
     # While Claude works: typing shows, Enter queues, Shift+Tab switches the mode for the next tool.
-    scenario([{"delay": 3.0, "tools": [{"name": "Write", "input": {"file_path": "/work/live.txt", "content": "ok"}}]}, {"text": "wrote"}, {"text": "queued answered"}])
+    scenario([{"delay": 3.0, "tools": [{"name": "Write", "input": {"file_path": "/work/live.txt", "content": "ok"}}]}, {"text": "queued answered"}])
     t.buf = b""
     t.send("write\r"); t.expect("esc to interrupt", 30)
     t.send("다음 질문"); t.expect("다음 질문", 10)
@@ -70,10 +72,10 @@ try:
     t.send("\r"); t.expect(r"\(queued\)", 10)
     t.send("\x1b[Z"); t.expect("accept edits on", 10)
     t.expect("queued answered", 60)
-    check("guest: shift+tab mid-turn applied, queued message sent", open(os.path.join(work, "live.txt")).read() == "ok" and any(b.get("text") == "다음 질문" for b in requests()[-1]["body"]["messages"][-1]["content"]), requests()[-1]["body"]["messages"][-1])
+    check("guest: shift+tab mid-turn applied, queued message read with the tool's result", open(os.path.join(work, "live.txt")).read() == "ok" and any("while you were working:\n다음 질문" in b.get("text", "") for b in requests()[-1]["body"]["messages"][-1]["content"]), requests()[-1]["body"]["messages"][-1])
     t.expect("accept edits on", 20)
     check("guest: the mode chosen mid-turn stays", True)
-    t.send("\x1b[Z\x1b[Z"); t.read(0.5)
+    t.send("\x1b[Z\x1b[Z\x1b[Z"); t.read(0.5)
 
     t.send("/config\r"); out = t.expect("Keep transcripts", 15)
     t.send("\x1b[B" * 6 + " "); t.expect("Streaming saved", 10)
@@ -86,6 +88,14 @@ try:
 
     t.send("\x04"); t.expect(r"# ", 20)
     check("guest: ctrl-d leaves claude", True)
+
+    # An OpenAI-compatible server: /model gives each model's context, asked through the host.
+    scenario([], models=[{"id": "served", "max_model_len": 8192}, {"id": "show:7b"}],
+             routes={"/api/ps": {"models": []}, "/api/show": {"by_model": {"show:7b": {"parameters": "num_ctx 4096"}}}})
+    t.send("claude --provider openai --base-url http://localhost:18091/v1\r"); t.expect("for shortcuts", 60)
+    t.send("/model\r"); out = plain(t.expect(r"2\. show:7b", 30)); t.read(0.5); out += plain(t.buf.decode(errors="replace"))
+    check("guest: /model gives the context the server runs each model with", bool(re.search(r"served\s+context 8,192", out) and re.search(r"show:7b\s+context 4,096", out)), out[-1200:])
+    t.send("\x1b"); t.read(0.5); t.send("\x04"); t.expect(r"# ", 20)
 finally:
     t.send(b"\x1dq"); time.sleep(0.5); t.close()
 shutil.rmtree(work, ignore_errors=True)

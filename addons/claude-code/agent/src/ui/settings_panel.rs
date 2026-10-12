@@ -4,6 +4,7 @@
 //! changes go to (local, project, user), Esc closes. A change is saved and in effect at once.
 use serde_json::{json, Value};
 
+use super::canvas::{synchronized, Canvas};
 use super::editor::Key;
 use super::terminal::TerminalUi;
 use crate::agent::Session;
@@ -120,7 +121,7 @@ pub fn open(session: &mut Session, ui: &mut TerminalUi) {
     let mut scope = Scope::Local;
     let mut status = String::new();
     let mut editing: Option<Editing> = None;
-    let mut drawn = 0usize;
+    let mut canvas = Canvas::new();
     let mode = term::Mode::raw();
     loop {
         let columns = term::columns().max(40);
@@ -173,14 +174,8 @@ pub fn open(session: &mut Session, ui: &mut TerminalUi) {
             }
         }
         lines.push(term::accent(&format!("╰{}╯", "─".repeat(columns - 2))));
-        let mut out = String::from("\r");
-        if drawn > 0 {
-            out.push_str(&format!("\x1b[{drawn}A"));
-        }
-        out.push_str("\x1b[J");
-        out.push_str(&lines.join("\r\n"));
-        term::raw(&out);
-        drawn = lines.len() - 1;
+        let last = lines.len() - 1;
+        term::raw(&synchronized(&canvas.draw(lines, (last, 0), columns, false)));
 
         let Some(key) = ui.keys.read() else { break };
         if let Some(edit) = editing.as_mut() {
@@ -247,15 +242,13 @@ pub fn open(session: &mut Session, ui: &mut TerminalUi) {
                     }
                     Kind::Model if key == Key::Enter || key == Key::Char(' ') => {
                         // The list replaces the panel for a moment.
-                        let mut clear = String::from("\r");
-                        if drawn > 0 {
-                            clear.push_str(&format!("\x1b[{drawn}A"));
-                        }
-                        term::raw(&(clear + "\x1b[J"));
-                        drawn = 0;
+                        term::raw(&canvas.erase());
                         let mut options: Vec<(String, String)> = match session.config.provider {
                             Provider::Anthropic => ALIASES.iter().map(|(alias, id, about)| (id.to_string(), format!("{alias}   {about}"))).collect(),
-                            Provider::OpenAi => crate::llm::list_models(&session.config).unwrap_or_default().into_iter().take(12).map(|id| (id.clone(), id)).collect(),
+                            Provider::OpenAi => {
+                                let models = crate::llm::list_models_with_context(&session.config, 12).unwrap_or_default();
+                                models.iter().map(|model| model.id.clone()).zip(super::terminal::model_labels(&models)).collect()
+                            }
                         };
                         options.push((String::new(), "Other… (type a model name)".into()));
                         let labels: Vec<String> = options.iter().map(|(_, label)| label.clone()).collect();
@@ -280,11 +273,7 @@ pub fn open(session: &mut Session, ui: &mut TerminalUi) {
             _ => {}
         }
     }
-    let mut clear = String::from("\r");
-    if drawn > 0 {
-        clear.push_str(&format!("\x1b[{drawn}A"));
-    }
-    term::raw(&(clear + "\x1b[J"));
+    term::raw(&canvas.erase());
     drop(mode);
     term::set_line_start(true);
 }

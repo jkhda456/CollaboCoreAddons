@@ -14,7 +14,7 @@ use crate::settings::Scope;
 use crate::term;
 use crate::ui::editor::{self, Editor, Read};
 use crate::ui::spinner;
-use crate::ui::terminal::{TerminalUi, Watcher};
+use crate::ui::terminal::{user_line, TerminalUi, Watcher};
 use crate::util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -202,6 +202,14 @@ fn welcome(session: &Session) {
         String::new(),
         term::dim(&format!("  cwd: {cwd}")),
         term::dim(&format!("  model: {} ({})", session.model, session.config.provider.name())),
+        term::dim(&format!(
+            "  context window: {} tokens ({})",
+            util::grouped(session.config.context_window),
+            match session.settings.u64("/contextWindow").and(session.settings.source_of("/contextWindow")) {
+                Some(scope) => format!("contextWindow in the {} settings", scope.name()),
+                None => "default · contextWindow sets it".into(),
+            }
+        )),
     ];
     let mut out = format!("{}\n", term::accent(&format!("╭{}╮", "─".repeat(columns - 2))));
     for line in lines {
@@ -238,17 +246,9 @@ fn status_line(session: &Session) -> Option<String> {
     Some(text).filter(|t| !t.trim().is_empty())
 }
 
-fn show_user_line(text: &str) {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = String::new();
-    for (index, line) in lines.iter().enumerate() {
-        out.push_str(&format!("{}{}\n", term::dim(if index == 0 { "> " } else { "  " }), term::dim(line)));
-    }
-    term::out(&out);
-}
-
-/// Runs a prompt, then the messages queued while it ran (unless it was interrupted: they go
-/// back to the input box). What the user was still typing waits in `ui.draft`.
+/// Runs a prompt, then the messages still queued when it ended (unless it was interrupted: they
+/// go back to the input box; send now interrupts too, and they are sent). Messages taken during
+/// the turn were read by the model already. What the user was still typing waits in `ui.draft`.
 fn run_prompt(session: &mut Session, ui: &mut TerminalUi, editor: &mut Editor, text: &str) {
     let mut next = Some(text.to_string());
     while let Some(prompt) = next.take() {
@@ -262,7 +262,8 @@ fn run_prompt(session: &mut Session, ui: &mut TerminalUi, editor: &mut Editor, t
         if let Some((queued, draft, mode)) = spinner::live_end() {
             session.mode = mode;
             let queued = queued.join("\n\n");
-            match (ui.was_interrupted, queued.is_empty()) {
+            let send_now = crate::interrupt::take_send_now();
+            match (ui.was_interrupted && !send_now, queued.is_empty()) {
                 (_, true) => ui.draft = draft,
                 (true, false) => ui.draft = if draft.is_empty() { queued } else { format!("{queued}\n{draft}") },
                 (false, false) => {
@@ -279,7 +280,7 @@ fn run_prompt(session: &mut Session, ui: &mut TerminalUi, editor: &mut Editor, t
         }
         term::out("\n");
         if let Some(queued) = &next {
-            show_user_line(queued);
+            user_line(queued);
         }
     }
 }
@@ -341,7 +342,7 @@ pub fn run(session: &mut Session, first: Option<String>) {
         if text.trim().is_empty() {
             continue;
         }
-        show_user_line(&text);
+        user_line(&text);
         if let Some(command) = text.strip_prefix('!') {
             bash_mode(session, &mut ui, command.trim());
             continue;
@@ -523,6 +524,7 @@ fn slash(session: &mut Session, ui: &mut TerminalUi, editor: &mut Editor, name: 
             if args.is_empty() {
                 let mut options: Vec<String> = Vec::new();
                 let mut ids: Vec<String> = Vec::new();
+                let mut models = Vec::new();
                 match session.config.provider {
                     crate::config::Provider::Anthropic => {
                         for (alias, id, description) in crate::config::ALIASES {
@@ -531,17 +533,30 @@ fn slash(session: &mut Session, ui: &mut TerminalUi, editor: &mut Editor, name: 
                         }
                     }
                     crate::config::Provider::OpenAi => {
-                        for id in crate::llm::list_models(&session.config).unwrap_or_default().into_iter().take(9) {
-                            options.push(id.clone());
-                            ids.push(id);
-                        }
+                        models = crate::llm::list_models_with_context(&session.config, 9).unwrap_or_default();
+                        options = crate::ui::terminal::model_labels(&models);
+                        ids = models.iter().map(|model| model.id.clone()).collect();
                     }
                 }
+                let window = session.config.context_window;
                 if options.is_empty() {
                     say(&format!("Model: {} (set one with /model NAME)", session.model));
-                } else if let Some(choice) = ui_choose(ui, &format!("Select model (now: {})", session.model), &[], &options) {
+                } else if let Some(choice) = ui_choose(ui, &format!("Select model (now: {} · context window {})", session.model, util::grouped(window)), &[], &options) {
                     session.model = ids[choice].clone();
-                    say(&format!("Set model to {}", term::bold(&session.model)));
+                    let mut lines = vec![format!("Set model to {}", term::bold(&session.model))];
+                    let (context, window_text) = (models.get(choice).and_then(|model| model.context), util::grouped(window));
+                    match context {
+                        Some(context) if context < window => lines.extend([
+                            term::yellow(&format!("The server gives it {} tokens of context, fewer than the context window ({window_text}):", util::grouped(context))),
+                            term::yellow("set contextWindow in /config, or the conversation outgrows it before it is compacted"),
+                        ]),
+                        Some(context) if context > window => lines.extend([
+                            term::dim(&format!("The server gives it {} tokens of context; the context window is {window_text}", util::grouped(context))),
+                            term::dim("(contextWindow in /config to use more)"),
+                        ]),
+                        _ => {}
+                    }
+                    say(&lines.join("\n"));
                 }
             } else {
                 session.model = crate::config::resolve_model(session.config.provider, args);
@@ -583,7 +598,7 @@ fn slash(session: &mut Session, ui: &mut TerminalUi, editor: &mut Editor, name: 
                 if ui.was_interrupted || !wait_for_next(ui, every) {
                     break;
                 }
-                show_user_line(&prompt);
+                user_line(&prompt);
             }
             say(&format!("⟳ Loop stopped after {rounds} run{}", if rounds == 1 { "" } else { "s" }));
         }

@@ -83,6 +83,12 @@ first_user = requests()[0]["body"]["messages"][0]["content"]
 check("UserPromptSubmit hook adds context", any("context from hook" in b.get("text", "") for b in first_user), first_user)
 os.remove(os.path.join(proj, ".claude/settings.json"))
 
+# Bypass can be taken away by the settings, as in Claude Code.
+json.dump({"permissions": {"disableBypassPermissionsMode": "disable"}}, open(os.path.join(proj, ".claude/settings.json"), "w"))
+code, out, err = run("-p", "--dangerously-skip-permissions", "go")
+check("disableBypassPermissionsMode refuses bypass", code != 0 and "disableBypassPermissionsMode" in err, (code, out, err))
+os.remove(os.path.join(proj, ".claude/settings.json"))
+
 # 6. TodoWrite, a sub-agent (Task), background shell.
 scenario([
     {"tools": [{"name": "TodoWrite", "input": {"todos": [{"content": "Look", "status": "in_progress", "activeForm": "Looking"}]}}]},

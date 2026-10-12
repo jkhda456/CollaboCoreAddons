@@ -1,4 +1,5 @@
 //! How the agent shows itself: the interactive terminal, -p's output, the spinner, the input box.
+pub mod canvas;
 pub mod editor;
 pub mod print;
 pub mod settings_panel;

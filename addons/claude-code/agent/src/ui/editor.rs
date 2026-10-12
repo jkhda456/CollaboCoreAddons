@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
+use super::canvas::{synchronized, Canvas};
 use crate::term;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -47,6 +48,9 @@ pub enum Key {
     CtrlR,
     /// Ctrl-T: the todo list on/off.
     CtrlT,
+    /// Ctrl+Enter or Ctrl+X Ctrl+S: while Claude works, send the queued messages now; at the
+    /// prompt, the same as Enter.
+    SendNow,
     Paste(String),
     Unknown,
 }
@@ -123,6 +127,15 @@ impl Keys {
             20 => Key::CtrlT,
             21 => Key::KillStart,
             23 => Key::DeleteWord,
+            // Ctrl+X Ctrl+S (for terminals that send Ctrl+Enter as a plain Enter).
+            0x18 => match self.byte(Some(1000)) {
+                Some(0x13) => Key::SendNow,
+                Some(other) => {
+                    self.pending.push_front(other);
+                    Key::Unknown
+                }
+                None => Key::Unknown,
+            },
             0x1b => self.escape(),
             b if b < 0x20 => Key::Unknown,
             b if b < 0x80 => Key::Char(b as char),
@@ -164,6 +177,7 @@ impl Keys {
                     "1;5C" | "1;3C" => Key::WordRight,
                     "1;5D" | "1;3D" => Key::WordLeft,
                     "13;2u" | "13;3u" => Key::NewLine,
+                    "13;5u" | "27;5;13~" => Key::SendNow,
                     "200~" => self.paste(),
                     _ => Key::Unknown,
                 }
@@ -231,8 +245,8 @@ pub struct Editor {
     cursor: usize,
     browsing: Option<usize>,
     draft: Vec<char>,
-    /// Rows from the top of the drawn region to the cursor's row.
-    cursor_row: usize,
+    /// The box (and the menu or footer under it) on screen.
+    canvas: Canvas,
     selected: usize,
     show_help: bool,
     last_esc: bool,
@@ -316,7 +330,7 @@ impl Editor {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|text| text.lines().filter_map(|line| serde_json::from_str::<String>(line).ok()).collect())
             .unwrap_or_default();
-        Editor { history, history_path, keys: Keys::default(), buffer: Vec::new(), cursor: 0, browsing: None, draft: Vec::new(), cursor_row: 0, selected: 0, show_help: false, last_esc: false, search: None, vim_normal: false, vim_pending: None, yank: Vec::new(), undo: Vec::new() }
+        Editor { history, history_path, keys: Keys::default(), buffer: Vec::new(), cursor: 0, browsing: None, draft: Vec::new(), canvas: Canvas::new(), selected: 0, show_help: false, last_esc: false, search: None, vim_normal: false, vim_pending: None, yank: Vec::new(), undo: Vec::new() }
     }
 
     fn remember(&mut self, line: &str) {
@@ -463,34 +477,20 @@ impl Editor {
             let gap = columns.saturating_sub(term::width(&left) + term::width(&right) + 2);
             lines.push(format!("{left}{}{right}", " ".repeat(gap)));
         }
-        // Back to the top of the last drawing, clear, draw, and put the cursor in the box.
-        let mut out = String::from("\r");
-        if self.cursor_row > 0 {
-            out.push_str(&format!("\x1b[{}A", self.cursor_row));
-        }
-        out.push_str("\x1b[J");
-        out.push_str(&lines.join("\r\n"));
-        let target_row = 1 + cursor_row;
-        let up = lines.len() - 1 - target_row;
-        if up > 0 {
-            out.push_str(&format!("\x1b[{up}A"));
-        }
-        out.push_str(&format!("\r\x1b[{}C", 4 + cursor_col));
+        // Over the last drawing, only the lines that changed (a key changes one or two), and the
+        // cursor in the box: never cleared first, so the box is not seen to blink as one types.
+        let text = self.canvas.draw(lines, (1 + cursor_row, 4 + cursor_col), columns, false);
         let _guard = term::lock();
-        term::raw(&out);
-        self.cursor_row = target_row;
+        if !text.is_empty() {
+            term::raw(&synchronized(&text));
+        }
     }
 
     /// Removes the drawing, leaving the cursor where it began.
     fn clear(&mut self) {
-        let mut out = String::from("\r");
-        if self.cursor_row > 0 {
-            out.push_str(&format!("\x1b[{}A", self.cursor_row));
-        }
-        out.push_str("\x1b[J");
+        let text = self.canvas.erase();
         let _guard = term::lock();
-        term::raw(&out);
-        self.cursor_row = 0;
+        term::raw(&text);
     }
 
     fn history_step(&mut self, back: bool) {
@@ -530,7 +530,7 @@ impl Editor {
         self.buffer = prefill.chars().collect();
         self.cursor = self.buffer.len();
         self.browsing = None;
-        self.cursor_row = 0;
+        self.canvas.forget();
         self.selected = 0;
         self.show_help = false;
         self.search = None;
@@ -602,7 +602,7 @@ impl Editor {
                 self.show_help = false;
             }
             match key {
-                Key::Enter => {
+                Key::Enter | Key::SendNow => {
                     if let Some((choice, _)) = suggestions.get(self.selected) {
                         let exact = self.text().trim_end() == choice.as_str();
                         if choice.starts_with('/') && !exact {
@@ -731,7 +731,7 @@ impl Editor {
                 }
                 Key::CtrlL => {
                     term::raw("\x1b[2J\x1b[H");
-                    self.cursor_row = 0;
+                    self.canvas.forget();
                 }
                 Key::Unknown => {}
             }
@@ -981,6 +981,9 @@ mod tests {
         assert_eq!(keys(b"\x1b[A\x1b[Z\x1b[3~\x1b\r\x1bb"), [Key::Up, Key::ShiftTab, Key::Delete, Key::NewLine, Key::WordLeft]);
         assert_eq!(keys(b"\x1b[200~line1\r\nline2\x1b[201~x"), [Key::Paste("line1\nline2".into()), Key::Char('x')]);
         assert_eq!(keys(b"\x03\x04\x17"), [Key::CtrlC, Key::CtrlD, Key::DeleteWord]);
+        // Send now: Ctrl+X Ctrl+S, and Ctrl+Enter as kitty and xterm's modifyOtherKeys send it.
+        assert_eq!(keys(b"\x18\x13\x1b[13;5u\x1b[27;5;13~"), [Key::SendNow, Key::SendNow, Key::SendNow]);
+        assert_eq!(keys(b"\x18a"), [Key::Unknown, Key::Char('a')]);
     }
 
     #[test]

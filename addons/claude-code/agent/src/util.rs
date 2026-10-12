@@ -94,6 +94,19 @@ pub fn tokens(count: u64) -> String {
     }
 }
 
+/// "32,768".
+pub fn grouped(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 /// A Markdown file's YAML front matter (flat `key: value` lines) and its body.
 pub fn front_matter(text: &str) -> (std::collections::HashMap<String, String>, String) {
     let mut fields = std::collections::HashMap::new();
@@ -135,6 +148,11 @@ pub fn split_list(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grouped_digits() {
+        assert_eq!([0, 999, 1000, 32768, 1048576].map(super::grouped), ["0", "999", "1,000", "32,768", "1,048,576"]);
+    }
+
     #[test]
     fn front_matter_and_lists() {
         let (fields, body) = super::front_matter("---\nname: reviewer\ndescription: \"Reviews code\"\ntools: Read, Bash(git diff:*)\n---\nYou review.\n");

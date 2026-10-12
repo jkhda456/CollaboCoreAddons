@@ -28,6 +28,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::editor::{Key, Keys};
+use super::canvas::{synchronized, Canvas};
 use super::spinner;
 use crate::agent::{Approval, PlanAnswer, Ui};
 use crate::permissions::Mode;
@@ -154,7 +155,7 @@ impl TerminalUi {
         let _mode = term::Mode::raw();
         let columns = term::columns().max(30);
         let mut selected = 0usize;
-        let mut drawn_rows = 0usize;
+        let mut canvas = Canvas::new();
         let result = loop {
             let mut lines = vec![term::accent(&format!("╭{}╮", "─".repeat(columns - 2)))];
             let mut row = |text: String| {
@@ -178,14 +179,8 @@ impl TerminalUi {
                 });
             }
             lines.push(term::accent(&format!("╰{}╯", "─".repeat(columns - 2))));
-            let mut out = String::from("\r");
-            if drawn_rows > 0 {
-                out.push_str(&format!("\x1b[{}A", drawn_rows));
-            }
-            out.push_str("\x1b[J");
-            out.push_str(&lines.join("\r\n"));
-            term::raw(&out);
-            drawn_rows = lines.len() - 1;
+            let last = lines.len() - 1;
+            term::raw(&synchronized(&canvas.draw(lines, (last, 0), columns, false)));
             match self.keys.read() {
                 Some(Key::Up) => selected = (selected + options.len() - 1) % options.len(),
                 Some(Key::Down) | Some(Key::Tab) => selected = (selected + 1) % options.len(),
@@ -200,12 +195,7 @@ impl TerminalUi {
                 _ => {}
             }
         };
-        let mut out = String::from("\r");
-        if drawn_rows > 0 {
-            out.push_str(&format!("\x1b[{}A", drawn_rows));
-        }
-        out.push_str("\x1b[J");
-        term::raw(&out);
+        term::raw(&canvas.erase());
         term::set_line_start(true);
         result
     }
@@ -505,6 +495,14 @@ impl Ui for TerminalUi {
         spinner::set_tokens(total_output);
     }
 
+    fn take_queued(&mut self) -> Vec<String> {
+        let queued = spinner::take_queued();
+        for text in &queued {
+            user_line(text);
+        }
+        queued
+    }
+
     fn interrupted(&mut self) {
         self.was_interrupted = true;
         spinner::stop();
@@ -536,6 +534,28 @@ impl TerminalUi {
         self.flush_pending_call(true);
         self.pause_watcher();
     }
+}
+
+/// A message of the user's in the conversation, as typed ("> " before its first line).
+pub fn user_line(text: &str) {
+    let mut out = String::new();
+    for (index, line) in text.lines().enumerate() {
+        out.push_str(&format!("{}{}\n", term::dim(if index == 0 { "> " } else { "  " }), term::dim(line)));
+    }
+    term::out(&out);
+}
+
+/// The models of a list to choose from, each with the context window its server gives it (when
+/// the server says), in a column. Plain text: a chosen option is painted as a whole.
+pub fn model_labels(models: &[crate::llm::Model]) -> Vec<String> {
+    let width = models.iter().filter(|model| model.context.is_some()).map(|model| term::width(&model.id)).max().unwrap_or(0).min(40);
+    models
+        .iter()
+        .map(|model| match model.context {
+            Some(context) => format!("{}{}   context {}", model.id, " ".repeat(width.saturating_sub(term::width(&model.id))), crate::util::grouped(context)),
+            None => model.id.clone(),
+        })
+        .collect()
 }
 
 /// Reads all of stdin (for -p with a piped prompt).

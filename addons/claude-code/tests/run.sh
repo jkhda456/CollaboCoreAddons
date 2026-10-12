@@ -41,7 +41,7 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) platform=darwin-arm64 ;; Darwin-x86_64) platform=darwin-x64 ;;
 esac
 export COLLABO_RUNTIME="$ROOT/dist/runtime/collabo-core-$platform"
-[[ -f "$COLLABO_RUNTIME/app/images/addons/claude-code.cpio" ]] || { echo "no runtime with the add-on; run: ./build.sh addons engine runtime" >&2; exit 1; }
+[[ -f "$COLLABO_RUNTIME/app/images/addons/claude-code.cpio" ]] || { echo "no runtime with the add-on; run: python3 addons/build.py build claude-code && ./build.sh engine runtime" >&2; exit 1; }
 echo "== in the guest: -p"
 python3 "$T/test_guest.py"
 echo "== in the guest: interactive"

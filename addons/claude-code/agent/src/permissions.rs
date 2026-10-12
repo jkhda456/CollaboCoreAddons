@@ -44,7 +44,7 @@ impl Mode {
         }
     }
 
-    /// Shift+Tab: default → accept edits → plan → (bypass, when it was allowed at start) → default.
+    /// Shift+Tab: default → accept edits → plan → bypass (unless the settings disable it) → default.
     pub fn next(self, bypass_available: bool) -> Mode {
         match self {
             Mode::Default => Mode::AcceptEdits,
