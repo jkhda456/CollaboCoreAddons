@@ -1,0 +1,27 @@
+libpcap (nmap's copy): the package's name and version back in configure
+
+nmap's copy of libpcap renames VERSION to VERSION.txt, and its generated
+configure lost the name and version with it (AC_INIT reads VERSION.txt with
+m4_esyscmd_s when autoconf runs, and nmap's build never asks for them). Without
+them pcap_lib_version() says "libpcap version  (...)", and libpcap.pc has an
+empty Version and "-l" for "-lpcap". These are what AC_INIT(pcap, 1.10.7) sets.
+
+diff --git a/configure b/configure
+index a6d6224..a238445 100755
+--- a/configure
++++ b/configure
+@@ -606,10 +606,10 @@ MFLAGS=
+ MAKEFLAGS=
+ 
+ # Identity of this package.
+-PACKAGE_NAME=''
+-PACKAGE_TARNAME=''
+-PACKAGE_VERSION=''
+-PACKAGE_STRING=''
++PACKAGE_NAME='pcap'
++PACKAGE_TARNAME='pcap'
++PACKAGE_VERSION='1.10.7'
++PACKAGE_STRING='pcap 1.10.7'
+ PACKAGE_BUGREPORT=''
+ PACKAGE_URL=''
+ 

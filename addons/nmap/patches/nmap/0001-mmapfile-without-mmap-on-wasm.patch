@@ -1,0 +1,119 @@
+nmap: mmapfile() without mmap() on WebAssembly
+
+The guest's libc has no mmap(): a WebAssembly process's memory is its own and
+cannot map a file. mmapfile() reads the file into memory instead, and
+munmap() of that memory (wasm_munmapfile) writes it back when it was opened
+for writing, as the shared mapping would have. --resume is the only user (it
+puts a newline at the end of the log file), one file at a time, as on Windows.
+
+diff --git a/utils.cc b/utils.cc
+index c8f6c20..2234052 100644
+--- a/utils.cc
++++ b/utils.cc
+@@ -513,7 +513,78 @@ int cpe_get_part(const char *cpe) {
+ }
+ 
+ 
+-#ifndef WIN32
++#if defined(__wasm__)
++/* The file mmapfile() read last, to write back on munmap() (one at a time, as
++   on Windows; --resume is the only user). */
++static int wasm_mapped_fd = -1;
++
++char *mmapfile(char *fname, s64 *length, int openflags) {
++  struct stat st;
++  int fd;
++  char *fileptr;
++  s64 done;
++
++  if (!length || !fname) {
++    errno = EINVAL;
++    return NULL;
++  }
++  *length = -1;
++  fd = open(fname, openflags);
++  if (fd == -1)
++    return NULL;
++  if (fstat(fd, &st) == -1) {
++    close(fd);
++    return NULL;
++  }
++  fileptr = (char *) malloc(st.st_size + 1);
++  if (fileptr == NULL) {
++    close(fd);
++    errno = ENOMEM;
++    return NULL;
++  }
++  for (done = 0; done < st.st_size; ) {
++    ssize_t got = pread(fd, fileptr + done, st.st_size - done, done);
++    if (got <= 0) {
++      if (got == 0)
++        errno = EIO;
++      free(fileptr);
++      close(fd);
++      return NULL;
++    }
++    done += got;
++  }
++  fileptr[st.st_size] = '\0';
++  if ((openflags & O_ACCMODE) == O_RDONLY) {
++    close(fd);
++  } else {
++    if (wasm_mapped_fd != -1)
++      close(wasm_mapped_fd);
++    wasm_mapped_fd = fd;
++  }
++  *length = st.st_size;
++  return fileptr;
++}
++
++int wasm_munmapfile(char *filestr, s64 filelen) {
++  int ret = 0;
++  s64 done;
++
++  if (wasm_mapped_fd != -1) {
++    for (done = 0; done < filelen; ) {
++      ssize_t put = pwrite(wasm_mapped_fd, filestr + done, filelen - done, done);
++      if (put <= 0) {
++        ret = -1;
++        break;
++      }
++      done += put;
++    }
++    close(wasm_mapped_fd);
++    wasm_mapped_fd = -1;
++  }
++  free(filestr);
++  return ret;
++}
++#elif !defined(WIN32)
+ static int open2mmap_flags(int open_flags)
+ {
+   switch (open_flags) {
+diff --git a/utils.h b/utils.h
+index 4574811..44ae2d8 100644
+--- a/utils.h
++++ b/utils.h
+@@ -63,7 +63,7 @@
+ #ifndef UTILS_H
+ #define UTILS_H
+ 
+-#ifndef WIN32
++#if !defined(WIN32) && !defined(__wasm__)
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -126,5 +126,13 @@ char *mmapfile(char *fname, s64 *length, int openflags);
+ int win32_munmap(char *filestr, int filelen);
+ #endif /* WIN32 */
+ 
++#ifdef __wasm__
++/* No mmap() on WebAssembly (a process's memory is its own): mmapfile() reads the
++   file into memory, and munmap() of that memory writes it back if it was opened
++   for writing. */
++int wasm_munmapfile(char *filestr, s64 filelen);
++#define munmap(ptr, len) wasm_munmapfile(ptr, len)
++#endif /* __wasm__ */
++
+ #endif /* UTILS_H */
+ 

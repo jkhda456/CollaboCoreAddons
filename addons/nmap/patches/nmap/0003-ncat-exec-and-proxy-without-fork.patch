@@ -1,0 +1,364 @@
+ncat: -e, -c, --lua-exec and the HTTP proxy without fork()
+
+The guest has no fork() (HAVE_FORK is not defined), only posix_spawn(). Ncat
+forks twice for -e/-c/--lua-exec (a caretaker Ncat per connection with -k, which
+forks the command) and once per client of --proxy-type http in listen mode.
+Without fork(), as Ncat does on Windows:
+
+- netexec() is split into netexec_start() (pipes, then fork and exec as
+  before, or posix_spawn() with the dispositions the forked child restored
+  and the NCAT_* environment) and netexec_relay() (the caretaker loop).
+- --lua-exec runs this program again with --lua-exec-internal, as on Windows.
+- netrun() (-k): the command is started in the listener, whose SIGCHLD
+  handler reaps it as before, and a detached thread relays for it; the thread
+  polls for the command's end (it cannot wait for it). The pipes are
+  close-on-exec, so the commands of other connections do not hold them.
+- A client that is gone before its command starts is dropped, not the
+  listener (setup_environment() ends the process it runs in).
+- The HTTP proxy handles each client in a detached thread.
+
+With fork() the code does what it did.
+
+diff --git a/ncat/ncat_posix.c b/ncat/ncat_posix.c
+index 520e7ea..c6a356e 100644
+--- a/ncat/ncat_posix.c
++++ b/ncat/ncat_posix.c
+@@ -76,11 +76,71 @@ static void sigchld_watcher(int signum)
+     errno = saved_errno;
+ }
+ 
++static int netexec_start(struct fdinfo *info, char *cmdexec, int *to_child, int *from_child);
++static void netexec_relay(struct fdinfo *info, int pid, int to_child, int from_child, int threaded);
++
++#ifndef HAVE_FORK
++/* Without fork() (WebAssembly), the command is started with posix_spawn(), and
++   what the forked Ncat would do for a connection - relay between the socket
++   and the command - runs in a thread of this process when there are several
++   connections (-k), as it does on Windows. */
++#include <spawn.h>
++#include <pthread.h>
++
++extern char **environ;
++
++struct netrun_job {
++    struct fdinfo info;
++    int pid;
++    int to_child;
++    int from_child;
++};
++
++static void *netrun_thread(void *arg)
++{
++    struct netrun_job *job = (struct netrun_job *) arg;
++
++    netexec_relay(&job->info, job->pid, job->to_child, job->from_child, 1);
++    free(job);
++    return NULL;
++}
++#endif
++
+ /* fork and exec a child process with netexec. Close the given file descriptor
+    in the parent process. Return the child's PID or -1 on error. */
+ int netrun(struct fdinfo *info, char *cmdexec)
+ {
+     int pid;
++#ifndef HAVE_FORK
++    struct netrun_job *job;
++    pthread_attr_t attr;
++    pthread_t thread;
++
++    /* The command starts here, in the listener; a thread relays for it. The
++       listener's SIGCHLD handler reaps it as it reaps forked children. */
++    job = (struct netrun_job *) safe_malloc(sizeof(*job));
++    job->info = *info;
++    pid = netexec_start(&job->info, cmdexec, &job->to_child, &job->from_child);
++    if (pid == -1) {
++        Close(info->fd);
++        free(job);
++        return -1;
++    }
++    job->pid = pid;
++    pthread_attr_init(&attr);
++    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++    if (pthread_create(&thread, &attr, netrun_thread, job) != 0) {
++        if (o.verbose)
++            logdebug("Error in pthread_create: %s\n", strerror(errno));
++        close(job->to_child);
++        close(job->from_child);
++        Close(info->fd);
++        free(job);
++        kill(pid, SIGTERM);
++    }
++    pthread_attr_destroy(&attr);
++    return pid;
++#else
+ 
+     errno = 0;
+     pid = fork();
+@@ -102,6 +162,7 @@ int netrun(struct fdinfo *info, char *cmdexec)
+         logdebug("Error in fork: %s\n", strerror(errno));
+ 
+     return pid;
++#endif
+ }
+ 
+ /* Call write in a loop until all the data is written or an error occurs. The
+@@ -159,21 +220,14 @@ static void shutdown_PIPE_OUT(struct fdinfo *info, int child_stdout, int child_s
+   *maxfd = checked_fd_isset(info->fd, fds) ? info->fd : -1;
+ }
+ 
+-/* Run the given command line as if with exec. What we actually do is fork the
+-   command line as a subprocess, then loop, relaying data between the socket and
+-   the subprocess. This allows Ncat to handle SSL from the socket and give plain
+-   text to the subprocess, and also allows things like logging and line delays.
+-   Never returns. */
+-void netexec(struct fdinfo *info, char *cmdexec)
++/* Start the command for netexec, its standard input and output pipes to us:
++   *to_child and *from_child are our ends. Returns its PID; without fork(), -1
++   if it could not be started. */
++static int netexec_start(struct fdinfo *info, char *cmdexec, int *to_child, int *from_child)
+ {
+     int child_stdin[2];
+     int child_stdout[2];
+     int pid;
+-    int crlf_state;
+-
+-    char buf[DEFAULT_TCP_BUF_LEN];
+-    int maxfd;
+-    fd_set all_fds;
+ 
+     if (o.debug) {
+         switch (o.execmode) {
+@@ -191,13 +245,95 @@ void netexec(struct fdinfo *info, char *cmdexec)
+         }
+     }
+ 
++#ifndef HAVE_FORK
++    {
++        posix_spawn_file_actions_t actions;
++        posix_spawnattr_t attr;
++        sigset_t defaults;
++        char *shell_argv[] = { (char *) "sh", (char *) "-c", cmdexec, NULL };
++#ifdef HAVE_LUA
++        char *lua_argv[] = { (char *) "ncat", (char *) "--lua-exec-internal", cmdexec, NULL };
++#endif
++        char **cmdargs = NULL;
++        const char *path;
++        char **argv;
++        int err;
++
++        union sockaddr_u peer;
++        socklen_t peerlen = sizeof(peer);
++
++        /* setup_environment() runs here, in the listener, and ends the process
++           (bye) when the client has gone already: that ends only a forked
++           child. */
++        if (getpeername(info->fd, &peer.sockaddr, &peerlen) != 0) {
++            if (o.verbose)
++                logdebug("getpeername failed: %s\n", socket_strerror(socket_errno()));
++            return -1;
++        }
++
++        /* Close-on-exec, so that the commands of other connections do not keep
++           this one's pipes open. */
++        if (pipe2(child_stdin, O_CLOEXEC) == -1 || pipe2(child_stdout, O_CLOEXEC) == -1)
++            bye("Can't create child pipes: %s", strerror(errno));
++
++        switch (o.execmode) {
++        case EXEC_SHELL:
++            path = "/bin/sh";
++            argv = shell_argv;
++            break;
++#ifdef HAVE_LUA
++        case EXEC_LUA:
++            /* This program again, as the Lua interpreter (as on Windows) */
++            path = "/proc/self/exe";
++            argv = lua_argv;
++            break;
++#endif
++        default:
++            cmdargs = cmdline_split(cmdexec);
++            path = cmdargs[0];
++            argv = cmdargs;
++            break;
++        }
++
++        posix_spawn_file_actions_init(&actions);
++        posix_spawn_file_actions_adddup2(&actions, child_stdin[0], STDIN_FILENO);
++        posix_spawn_file_actions_adddup2(&actions, child_stdout[1], STDOUT_FILENO);
++        /* The dispositions a forked child would restore: a broken connection
++           ends the command with SIGPIPE, and termination signals end it. */
++        posix_spawnattr_init(&attr);
++        sigemptyset(&defaults);
++        sigaddset(&defaults, SIGPIPE);
++        sigaddset(&defaults, SIGINT);
++        sigaddset(&defaults, SIGTERM);
++        sigaddset(&defaults, SIGHUP);
++        sigaddset(&defaults, SIGQUIT);
++        sigaddset(&defaults, SIGCHLD);
++        posix_spawnattr_setsigdefault(&attr, &defaults);
++        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
++
++        setup_environment(info);
++        err = posix_spawn(&pid, path, &actions, &attr, argv, environ);
++        posix_spawn_file_actions_destroy(&actions);
++        posix_spawnattr_destroy(&attr);
++        if (cmdargs != NULL) {
++            char **a;
++            for (a = cmdargs; *a != NULL; a++)
++                free(*a);
++            free(cmdargs);
++        }
++        close(child_stdin[0]);
++        close(child_stdout[1]);
++        if (err != 0) {
++            loguser("exec %s: %s\n", path, strerror(err));
++            close(child_stdin[1]);
++            close(child_stdout[0]);
++            return -1;
++        }
++    }
++#else
+     if (pipe(child_stdin) == -1 || pipe(child_stdout) == -1)
+         bye("Can't create child pipes: %s", strerror(errno));
+ 
+-    /* No longer using ncat_listen.c's sigchld_handler */
+-    Signal(SIGCHLD, sigchld_watcher);
+-
+-    child_alive = 1;
+     pid = fork();
+     if (pid == -1)
+         bye("Error in fork: %s", strerror(errno));
+@@ -243,6 +379,46 @@ void netexec(struct fdinfo *info, char *cmdexec)
+ 
+     close(child_stdin[0]);
+     close(child_stdout[1]);
++#endif
++
++    *to_child = child_stdin[1];
++    *from_child = child_stdout[0];
++    return pid;
++}
++
++/* Run the given command line as if with exec. What we actually do is fork the
++   command line as a subprocess, then loop, relaying data between the socket and
++   the subprocess. This allows Ncat to handle SSL from the socket and give plain
++   text to the subprocess, and also allows things like logging and line delays.
++   Never returns. */
++void netexec(struct fdinfo *info, char *cmdexec)
++{
++    int to_child, from_child;
++    int pid;
++
++    /* No longer using ncat_listen.c's sigchld_handler */
++    Signal(SIGCHLD, sigchld_watcher);
++
++    child_alive = 1;
++    pid = netexec_start(info, cmdexec, &to_child, &from_child);
++    if (pid == -1)
++        exit(1);
++    netexec_relay(info, pid, to_child, from_child, 0);
++    exit(0);
++}
++
++/* The "caretaker" loop of netexec, until the command ends or both directions
++   are closed. In a thread (without fork(), -k), the command's end is noticed
++   by polling, as the listener's SIGCHLD handler reaps it. */
++static void netexec_relay(struct fdinfo *info, int pid, int to_child, int from_child, int threaded)
++{
++    int child_stdin[2] = { -1, to_child };
++    int child_stdout[2] = { from_child, -1 };
++    int crlf_state;
++
++    char buf[DEFAULT_TCP_BUF_LEN];
++    int maxfd;
++    fd_set all_fds;
+ 
+     maxfd = child_stdout[0];
+     if (info->fd > maxfd)
+@@ -263,17 +439,23 @@ void netexec(struct fdinfo *info, char *cmdexec)
+     checked_fd_set(child_stdout[0], &all_fds);
+ #define PIPE_CLOSE(_PipeName) shutdown_##_PipeName(info, child_stdout[0], child_stdin[1], &all_fds, &maxfd)
+ 
+-    while (child_alive && maxfd >= 0) {
++    while ((threaded || child_alive) && maxfd >= 0) {
+         fd_set fds = all_fds;
+         int r, n_r;
++        struct timeval tv = { 0, 250000 };
+ 
+-        r = fselect(maxfd + 1, &fds, NULL, NULL, NULL);
++        r = fselect(maxfd + 1, &fds, NULL, NULL, threaded ? &tv : NULL);
+         if (r == -1) {
+             if (errno == EINTR)
+                 continue;
+             else
+                 break;
+         }
++        if (threaded && r == 0) {
++            if (kill(pid, 0) == -1 && errno == ESRCH)
++                break;  /* the command ended and was reaped */
++            continue;
++        }
+         if (checked_fd_isset(info->fd, &fds)) {
+             int pending;
+ 
+@@ -333,6 +515,9 @@ void netexec(struct fdinfo *info, char *cmdexec)
+ #endif
+     close(info->fd);
+ 
++    if (threaded)
++        return;  /* the listener reaps the command */
++
+     while (waitpid(pid, NULL, 0) < 0) {
+         if (errno == ECHILD) {
+             break;
+@@ -342,8 +527,6 @@ void netexec(struct fdinfo *info, char *cmdexec)
+         }
+         die("waitpid");
+     }
+-
+-    exit(0);
+ }
+ 
+ /*
+diff --git a/ncat/ncat_proxy.c b/ncat/ncat_proxy.c
+index 327dcf3..263f5cc 100644
+--- a/ncat/ncat_proxy.c
++++ b/ncat/ncat_proxy.c
+@@ -256,6 +256,36 @@ static void fork_handler(int s, int c)
+     }
+     CloseHandle(thread);
+ }
++#elif !defined(HAVE_FORK)
++/* Without fork() (WebAssembly), a thread too. */
++#include <pthread.h>
++
++static void *handler_thread_func(void *data)
++{
++    http_server_handler(*((int *) data));
++    free(data);
++
++    return NULL;
++}
++
++static void fork_handler(int s, int c)
++{
++    int *data;
++    pthread_t thread;
++    pthread_attr_t attr;
++
++    data = (int *) safe_malloc(sizeof(int));
++    *data = c;
++    pthread_attr_init(&attr);
++    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++    if (pthread_create(&thread, &attr, handler_thread_func, data) != 0) {
++        if (o.verbose)
++            logdebug("Error in pthread_create: %s\n", strerror(errno));
++        free(data);
++        Close(c);
++    }
++    pthread_attr_destroy(&attr);
++}
+ #else
+ static void fork_handler(int s, int c)
+ {

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The nmap add-on's C++ compiler for the guest: see wasm-nmap-cc. (A script, not a link: the name
+# is what picks C++.)
+exec "$(dirname "${BASH_SOURCE[0]}")/wasm-nmap-cc" --wasm-nmap-c++ "$@"

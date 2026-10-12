@@ -1,0 +1,4 @@
+{
+  "name": "tcpdump",
+  "description": "tcpdump: the packet analyzer (tcpdump.org's development tree with libpcap 1.10.7) in the guest: capture on eth0, lo or any, BPF filters, decoding, pcap files to read and write; needs a kernel with packet sockets (addons/mod/0013)"
+}

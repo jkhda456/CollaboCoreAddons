@@ -1,0 +1,372 @@
+libpcap: capture on Linux with recvmsg() where there is no mmap()
+
+libpcap 1.10 reads packets only from the memory-mapped ring (TPACKET_V2/V3).
+The guest is WebAssembly: a process's memory is its own linear memory, which
+cannot map the kernel's ring, and the guest's libc has no mmap() at all. With
+PCAP_LINUX_NO_MMAP (set on __wasm__), libpcap reads one packet at a time with
+recvmsg(), as it did before 1.10:
+
+- setup_recv() replaces setup_mmapped(): a buffer laid out as a ring frame
+  (a tpacket2_hdr's room, the sockaddr_ll, headroom for a cooked header and a
+  VLAN tag, the packet), PACKET_AUXDATA (VLAN tag, length on the wire),
+  SO_TIMESTAMPNS (arrival time), and a 2 MB receive buffer standing in for the
+  ring (SO_RCVBUFFORCE, or SO_RCVBUF as far as rmem_max lets it).
+- pcap_read_linux_recv() receives into that buffer and hands each packet to
+  pcap_handle_packet_mmap(), which does what it does for the ring: cooked
+  headers, VLAN tags, direction, userland filtering, snapshot length.
+- The wait (pcap_wait_for_frames_mmap) returns when the timeout goes by, so
+  pcap_dispatch() with a timeout returns, as it did with recvfrom().
+- pcap_setfilter_linux(): no ring blocks to filter in userland after a new
+  kernel filter; set_kernel_filter() drains the socket as before.
+- pcap_lib_version() says "with recvmsg(), without memory-mapped capture"; a
+  kernel without PF_PACKET gets "the kernel needs CONFIG_PACKET".
+
+The ring code stays (mmap()/munmap() are stubs that fail) and is not reached.
+
+diff --git a/pcap-linux.c b/pcap-linux.c
+index 7e04a04..ddae05a 100644
+--- a/pcap-linux.c
++++ b/pcap-linux.c
+@@ -84,7 +84,28 @@
+ #include <sys/socket.h>
+ #include <sys/ioctl.h>
+ #include <sys/utsname.h>
++#include <time.h>
++/*
++ * Without mmap() - WebAssembly, where a process's memory is its own and cannot
++ * map the kernel's ring - packets are read one at a time with recvmsg(), as
++ * libpcap did before 1.10 made the memory-mapped ring a requirement.
++ */
++#if defined(__wasm__) && !defined(PCAP_LINUX_NO_MMAP)
++#define PCAP_LINUX_NO_MMAP
++#endif
++#ifndef PCAP_LINUX_NO_MMAP
+ #include <sys/mman.h>
++#else
++/* only for the ring code, which is never reached: setup_recv() replaces setup_mmapped() */
++#define PROT_READ	1
++#define PROT_WRITE	2
++#define MAP_SHARED	1
++#define MAP_FAILED	((void *)-1)
++static void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
++{ (void)addr; (void)len; (void)prot; (void)flags; (void)fd; (void)off; errno = ENOSYS; return MAP_FAILED; }
++static int munmap(void *addr, size_t len)
++{ (void)addr; (void)len; errno = ENOSYS; return -1; }
++#endif
+ #include <linux/if.h>
+ #include <linux/if_packet.h>
+ #include <linux/sockios.h>
+@@ -225,6 +246,10 @@ static int map_arphrd_to_dlt(pcap_t *, int, const char *, int);
+ static int pcap_activate_linux(pcap_t *);
+ static int setup_socket(pcap_t *, int);
+ static int setup_mmapped(pcap_t *);
++#ifdef PCAP_LINUX_NO_MMAP
++static int setup_recv(pcap_t *);
++static int pcap_read_linux_recv(pcap_t *, int, pcap_handler, u_char *);
++#endif
+ static int pcap_can_set_rfmon_linux(pcap_t *);
+ static int pcap_inject_linux(pcap_t *, const void *, int);
+ static int pcap_stats_linux(pcap_t *, struct pcap_stat *);
+@@ -1269,7 +1294,11 @@ pcap_activate_linux(pcap_t *handle)
+ 	 * Succeeded.
+ 	 * Try to set up memory-mapped access.
+ 	 */
++#ifdef PCAP_LINUX_NO_MMAP
++	ret = setup_recv(handle);
++#else
+ 	ret = setup_mmapped(handle);
++#endif
+ 	if (ret < 0) {
+ 		/*
+ 		 * We failed to set up to use it, or the
+@@ -1314,6 +1343,11 @@ pcap_activate_linux(pcap_t *handle)
+ 	handle->stats_op = pcap_stats_linux;
+ 	handle->breakloop_op = pcap_breakloop_linux;
+ 
++#ifdef PCAP_LINUX_NO_MMAP
++	handle->read_op = pcap_read_linux_recv;
++	/* the packet stays in handle->buffer until the next read */
++	handle->oneshot_callback = pcapint_oneshot;
++#else
+ 	switch (handlep->tp_version) {
+ 
+ 	case TPACKET_V2:
+@@ -1326,6 +1360,7 @@ pcap_activate_linux(pcap_t *handle)
+ #endif
+ 	}
+ 	handle->oneshot_callback = pcapint_oneshot_linux;
++#endif
+ 	handle->selectable_fd = handle->fd;
+ 
+ 	return status;
+@@ -2504,8 +2539,13 @@ setup_socket(pcap_t *handle, int is_any_device)
+ 			 * a real Linux kernel.
+ 			 */
+ 			status = PCAP_ERROR_CAPTURE_NOTSUP;
++#ifdef PCAP_LINUX_NO_MMAP
++			snprintf(handle->errbuf, PCAP_ERRBUF_SIZE,
++			    "PF_PACKET sockets not supported - the kernel needs CONFIG_PACKET");
++#else
+ 			snprintf(handle->errbuf, PCAP_ERRBUF_SIZE,
+ 			    "PF_PACKET sockets not supported - is this WSL1?");
++#endif
+ 		} else {
+ 			/*
+ 			 * Other error.
+@@ -3950,6 +3990,14 @@ static int pcap_wait_for_frames_mmap(pcap_t *handle)
+ 		 */
+ 		if (handlep->poll_timeout == 0)
+ 			break;
++#ifdef PCAP_LINUX_NO_MMAP
++		/*
++		 * Reading with recvmsg(), the timeout is ours to keep:
++		 * when it goes by, the read returns what it has.
++		 */
++		if (ret == 0 && !handlep->netdown)
++			break;
++#endif
+ 	}
+ 	return 0;
+ }
+@@ -4457,6 +4505,215 @@ pcap_read_linux_mmap_v2(pcap_t *handle, int max_packets, pcap_handler callback,
+ 	return pkts;
+ }
+ 
++#ifdef PCAP_LINUX_NO_MMAP
++/*
++ * Capture with recvmsg(), one packet at a time, for systems without mmap().
++ *
++ * Each packet is received into handle->buffer laid out as a ring frame would
++ * be - a tpacket2_hdr's room, the sockaddr_ll after it, then room for the
++ * headers pcap_handle_packet_mmap() puts in front of the packet (a cooked
++ * header, a VLAN tag), then the packet - so that function handles it as it
++ * handles the ring's.
++ */
++#define RECV_SLL_OFFSET	TPACKET_ALIGN(sizeof(struct tpacket2_hdr))
++#define RECV_MAC_OFFSET	TPACKET_ALIGN(RECV_SLL_OFFSET + sizeof(struct sockaddr_ll) + \
++			    SLL2_HDR_LEN + VLAN_TAG_LEN)
++#define RECV_EMPTY	(-100)	/* nothing to read now (not a PCAP_ERROR_ value) */
++
++static int
++setup_recv(pcap_t *handle)
++{
++	struct pcap_linux *handlep = handle->priv;
++	int one = 1;
++
++	handlep->tp_version = 0;	/* no ring */
++	handlep->tp_hdrlen = sizeof(struct tpacket2_hdr);
++	handle->bufsize = RECV_MAC_OFFSET + handle->snapshot;
++	handle->buffer = malloc(handle->bufsize);
++	if (handle->buffer == NULL) {
++		pcapint_fmt_errmsg_for_errno(handle->errbuf, PCAP_ERRBUF_SIZE,
++		    errno, "can't allocate packet buffer");
++		return PCAP_ERROR;
++	}
++
++	/*
++	 * The VLAN tag the kernel took off, and the packet's length before
++	 * the filter cut it, come in PACKET_AUXDATA; the time it arrived in
++	 * SO_TIMESTAMPNS.  Without them, there is no tag and the time is
++	 * when we read it.
++	 */
++	(void)setsockopt(handle->fd, SOL_PACKET, PACKET_AUXDATA, &one,
++	    sizeof(one));
++	(void)setsockopt(handle->fd, SOL_SOCKET, SO_TIMESTAMPNS, &one,
++	    sizeof(one));
++	/*
++	 * The socket's receive buffer stands in for the ring, and gets its
++	 * size: by default 2M, as the ring does.  Past net.core.rmem_max
++	 * only root may go.
++	 */
++	if (handle->opt.buffer_size == 0)
++		handle->opt.buffer_size = 2*1024*1024;
++	if (setsockopt(handle->fd, SOL_SOCKET, SO_RCVBUFFORCE,
++	    &handle->opt.buffer_size, sizeof(handle->opt.buffer_size)) == -1)
++		(void)setsockopt(handle->fd, SOL_SOCKET, SO_RCVBUF,
++		    &handle->opt.buffer_size, sizeof(handle->opt.buffer_size));
++	set_poll_timeout(handlep);
++	return 0;
++}
++
++/*
++ * Read one packet and hand it to the callback.  Returns 1 if the callback got
++ * it, 0 if it was filtered out, RECV_EMPTY if there was none to read, or a
++ * PCAP_ERROR_ value.
++ */
++static int
++pcap_recv_one_linux(pcap_t *handle, pcap_handler callback, u_char *user)
++{
++	struct pcap_linux *handlep = handle->priv;
++	u_char *frame = handle->buffer;
++	struct sockaddr_ll *sll = (struct sockaddr_ll *)(frame + RECV_SLL_OFFSET);
++	union {
++		struct cmsghdr cmsg;
++		char buf[CMSG_SPACE(sizeof(struct tpacket_auxdata)) +
++		    CMSG_SPACE(2 * sizeof(int64_t))];
++	} control;
++	struct tpacket_auxdata aux;
++	struct msghdr msg;
++	struct iovec iov;
++	struct cmsghdr *cmsg;
++	struct timespec ts = { 0, 0 };
++	int have_aux = 0, have_ts = 0;
++	ssize_t got;
++	unsigned int caplen, len;
++
++	memset(sll, 0, sizeof(*sll));
++	iov.iov_base = frame + RECV_MAC_OFFSET;
++	iov.iov_len = handle->bufsize - RECV_MAC_OFFSET;
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_name = sll;
++	msg.msg_namelen = sizeof(*sll);
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	msg.msg_control = &control;
++	msg.msg_controllen = sizeof(control);
++
++	got = recvmsg(handle->fd, &msg, MSG_TRUNC | MSG_DONTWAIT);
++	if (got < 0) {
++		switch (errno) {
++
++		case EAGAIN:
++#if EWOULDBLOCK != EAGAIN
++		case EWOULDBLOCK:
++#endif
++		case EINTR:
++			return RECV_EMPTY;
++
++		case ENETDOWN:
++			/*
++			 * The device went down or away; as for the ring,
++			 * the wait finds out which.
++			 */
++			handlep->netdown = 1;
++			handle->required_select_timeout = &netdown_timeout;
++			return RECV_EMPTY;
++
++		default:
++			pcapint_fmt_errmsg_for_errno(handle->errbuf,
++			    PCAP_ERRBUF_SIZE, errno, "recvmsg");
++			return PCAP_ERROR;
++		}
++	}
++	if (handlep->netdown) {
++		/* a packet: the device is there and up */
++		handlep->netdown = 0;
++		handle->required_select_timeout = NULL;
++	}
++
++	/* with MSG_TRUNC, got is the packet's length, not what fit */
++	caplen = (size_t)got < iov.iov_len ? (unsigned int)got : (unsigned int)iov.iov_len;
++	len = (unsigned int)got;
++	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++		size_t size = cmsg->cmsg_len - CMSG_LEN(0);
++
++		if (cmsg->cmsg_level == SOL_PACKET &&
++		    cmsg->cmsg_type == PACKET_AUXDATA &&
++		    size >= sizeof(aux)) {
++			memcpy(&aux, CMSG_DATA(cmsg), sizeof(aux));
++			have_aux = 1;
++		} else if (cmsg->cmsg_level == SOL_SOCKET &&
++		    cmsg->cmsg_type == SO_TIMESTAMPNS) {
++			/* 64-bit seconds and nanoseconds, or two longs */
++			if (size >= 2 * sizeof(int64_t)) {
++				int64_t v[2];
++
++				memcpy(v, CMSG_DATA(cmsg), sizeof(v));
++				ts.tv_sec = (time_t)v[0];
++				ts.tv_nsec = (long)v[1];
++				have_ts = 1;
++			} else if (size >= 2 * sizeof(long)) {
++				long v[2];
++
++				memcpy(v, CMSG_DATA(cmsg), sizeof(v));
++				ts.tv_sec = v[0];
++				ts.tv_nsec = v[1];
++				have_ts = 1;
++			}
++		}
++	}
++	if (have_aux && aux.tp_len > len)
++		len = aux.tp_len;	/* the length on the wire, before the filter cut it */
++	if (!have_ts)
++		(void)clock_gettime(CLOCK_REALTIME, &ts);
++
++	return pcap_handle_packet_mmap(handle, callback, user, frame, len,
++	    RECV_MAC_OFFSET, caplen, (unsigned int)ts.tv_sec,
++	    handle->opt.tstamp_precision == PCAP_TSTAMP_PRECISION_NANO ?
++	    (unsigned int)ts.tv_nsec : (unsigned int)(ts.tv_nsec / 1000),
++	    have_aux && VLAN_VALID(&aux, &aux),
++	    have_aux ? aux.tp_vlan_tci : 0,
++	    have_aux ? VLAN_TPID(&aux, &aux) : ETH_P_8021Q);
++}
++
++static int
++pcap_read_linux_recv(pcap_t *handle, int max_packets, pcap_handler callback,
++		u_char *user)
++{
++	int pkts = 0;
++	int waited = 0;
++	int ret;
++
++	if (PACKET_COUNT_IS_UNLIMITED(max_packets))
++		max_packets = INT_MAX;
++
++	while (pkts < max_packets) {
++		if (handle->break_loop) {
++			handle->break_loop = 0;
++			return PCAP_ERROR_BREAK;
++		}
++		ret = pcap_recv_one_linux(handle, callback, user);
++		if (ret == 1) {
++			pkts++;
++			continue;
++		}
++		if (ret == 0)
++			continue;	/* filtered out */
++		if (ret != RECV_EMPTY)
++			return ret;
++		/*
++		 * Nothing to read: return what we have, or wait (once) for
++		 * more - until the timeout, a pcap_breakloop() or an error.
++		 */
++		if (pkts > 0 || waited)
++			break;
++		ret = pcap_wait_for_frames_mmap(handle);
++		if (ret)
++			return ret;
++		waited = 1;
++	}
++	return pkts;
++}
++#endif /* PCAP_LINUX_NO_MMAP */
++
+ #ifdef HAVE_TPACKET3
+ static int
+ pcap_read_linux_mmap_v3(pcap_t *handle, int max_packets, pcap_handler callback,
+@@ -4782,6 +5039,14 @@ pcap_setfilter_linux(pcap_t *handle, struct bpf_program *filter)
+ 	if (handlep->filter_in_userland)
+ 		return 0;
+ 
++#ifdef PCAP_LINUX_NO_MMAP
++	/*
++	 * No ring: set_kernel_filter() drained the packets the old
++	 * filter had let through.
++	 */
++	return 0;
++#endif
++
+ 	/*
+ 	 * We're filtering in the kernel; the packets present in
+ 	 * all blocks currently in the ring were already filtered
+@@ -6183,7 +6448,9 @@ pcap_set_protocol_linux(pcap_t *p, int protocol)
+ /*
+  * Libpcap version string.
+  */
+-#if defined(HAVE_TPACKET3) && defined(PCAP_SUPPORT_NETMAP)
++#if defined(PCAP_LINUX_NO_MMAP)
++  #define ADDITIONAL_INFO_STRING	"with recvmsg(), without memory-mapped capture"
++#elif defined(HAVE_TPACKET3) && defined(PCAP_SUPPORT_NETMAP)
+   #define ADDITIONAL_INFO_STRING	"with TPACKET_V3 and netmap"
+ #elif defined(HAVE_TPACKET3)
+   #define ADDITIONAL_INFO_STRING	"with TPACKET_V3"

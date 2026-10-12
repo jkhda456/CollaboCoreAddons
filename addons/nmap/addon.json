@@ -1,0 +1,4 @@
+{
+  "name": "nmap",
+  "description": "nmap: the network scanner (nmap.org's development tree, 7.99x) in the guest, with its scripting engine (NSE) and scripts, version detection, Nping and Ncat; raw-packet scans need a kernel with packet sockets (addons/mod/0013)"
+}

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# The C and C++ compiler of the nmap add-on's build (CC/CXX of nmap's configure and its libraries'):
+# userspace/bin/wasm-cc, with libc++ (build/libcxx-install, no exceptions) for C++ (wasm-nmap-c++)
+# and the guest's link flags for programs.
+A="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$A/../.." && pwd)"
+LIBCXX="$A/build/libcxx-install"
+cxx=0; [[ "${1:-}" == --wasm-nmap-c++ ]] && { cxx=1; shift; }
+
+link=1 partial=0
+for a in "$@"; do
+  case "$a" in
+    -c|-S|-E|-M|-MM) link=0 ;;
+    -r|-Wl,-r) partial=1 ;;
+  esac
+done
+for a in "$@"; do case "$a" in -print-*|--version|-v|-dumpmachine) exec "$ROOT/userspace/bin/wasm-cc" "$@";; esac; done
+
+if [[ $cxx == 1 && $link == 0 ]]; then
+  # wasm-cc's compile, with libc++'s headers ahead of the C library's (wasm-cc puts the sysroot's
+  # first, and libc++'s <cstddef> must find its own <stddef.h>)
+  exec clang-19 --target=wasm32 -matomics -mbulk-memory -mllvm -wasm-enable-sjlj \
+    -D__linux__=1 -D__linux=1 -D__unix__=1 -D__unix=1 -D__gnu_linux__=1 \
+    -Wno-unused-command-line-argument -Wno-override-module -fno-exceptions \
+    -nostdinc++ -isystem "$LIBCXX/include/c++/v1" -isystem "$LIBCXX/include" \
+    -isystem "$ROOT/userspace/sysroot/include" "$@"
+fi
+post=()
+if [[ $link == 1 && $partial == 0 ]]; then
+  [[ $cxx == 1 ]] && post+=("$LIBCXX/lib/libc++.a" "$LIBCXX/lib/libc++abi.a")
+  post+=(-Wl,--import-memory -Wl,--max-memory=4294967296 -Wl,--shared-memory -Wl,--export-table
+         -Wl,-z,stack-size=8388608)
+fi
+exec "$ROOT/userspace/bin/wasm-cc" "$@" "${post[@]}"
