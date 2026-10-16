@@ -70,8 +70,12 @@ Options:
   --base-url <url>                 The API's base URL, e.g. http://localhost:11434/v1 for Ollama
                                    (localhost is the host computer: requests are made there)
   --api-key <key>                  A key to send from here; normally the host adds the app's key
+  --api-skip-tls-verify            Reach the model's API over https without checking its certificate
+                                   (a local server's self-signed one; the setting apiSkipTlsVerify)
   --max-tokens <n>                 Longest answer, in tokens
-  --max-turns <n>                  Stop after this many model calls in one prompt
+  --max-turns <n>                  Stop after this many model calls in one prompt (default 300)
+  --mcp-skip-tls-verify            Reach MCP servers over https without checking their certificate
+                                   (a local server's self-signed one; the setting mcpSkipTlsVerify)
   --no-stream                      Ask for whole answers instead of streamed ones
   --permission-mode <mode>         default, acceptEdits, plan or bypassPermissions
   --dangerously-skip-permissions   Bypass all permission checks (the sandbox is the boundary)
@@ -181,6 +185,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--api-key" => args.overrides.api_key = Some(value("--api-key")?),
             "--max-tokens" => args.overrides.max_tokens = Some(number("--max-tokens", value("--max-tokens")?)?),
             "--max-turns" => args.overrides.max_turns = Some(number("--max-turns", value("--max-turns")?)?),
+            "--api-skip-tls-verify" => args.overrides.api_skip_tls_verify = Some(true),
+            "--mcp-skip-tls-verify" => args.overrides.mcp_skip_tls_verify = Some(true),
             "--no-stream" => args.overrides.stream = Some(false),
             "--permission-mode" => args.permission_mode = Some(value("--permission-mode")?),
             "--dangerously-skip-permissions" => args.permission_mode = Some("bypassPermissions".into()),
@@ -215,6 +221,7 @@ fn mcp_command(argv: &[String], settings: &mut Settings) -> i32 {
     let mut scope = "local".to_string();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut transport = "stdio".to_string();
+    let mut skip_tls_verify = settings.bool("/mcpSkipTlsVerify").unwrap_or(false);
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut positional = Vec::new();
     let mut iter = argv.iter().skip(1).cloned();
@@ -228,6 +235,7 @@ fn mcp_command(argv: &[String], settings: &mut Settings) -> i32 {
                 }
             }
             "-t" | "--transport" => transport = iter.next().unwrap_or_default(),
+            "--mcp-skip-tls-verify" => skip_tls_verify = true,
             "-H" | "--header" => {
                 if let Some((k, v)) = iter.next().unwrap_or_default().split_once(':') {
                     headers.push((k.trim().into(), v.trim().into()));
@@ -246,7 +254,7 @@ fn mcp_command(argv: &[String], settings: &mut Settings) -> i32 {
             if all.is_empty() {
                 println!("No MCP servers configured. Use `claude mcp add` to add a server.");
             }
-            let connected = mcp::Mcp::connect(&all);
+            let connected = mcp::Mcp::connect(&all, skip_tls_verify);
             for server in &connected.servers {
                 println!("{}: {} - {}", server.name, server.scope, if server.status == "connected" { format!("✓ Connected ({} tools)", server.tools.len()) } else { format!("✗ {}", server.status) });
             }
@@ -496,7 +504,7 @@ fn main() {
     if interactive && !servers.is_empty() {
         eprint!("{}", term::dim(&format!("Connecting to {} MCP server(s)…\r", servers.len())));
     }
-    let mcp = mcp::Mcp::connect(&servers);
+    let mcp = mcp::Mcp::connect(&servers, config.mcp_skip_tls_verify);
     if interactive && !servers.is_empty() {
         eprint!("\r\x1b[2K");
     }

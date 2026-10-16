@@ -225,9 +225,10 @@ impl Session {
         self.record(&message, ui);
     }
 
-    /// The settings changed (/config set): the connection, the rules, the hooks and the
-    /// environment follow at once. The model changes only if the settings' model did.
-    pub fn reload_settings(&mut self) -> Result<(), String> {
+    /// The settings changed (/config set): the connection, the rules, the hooks, the
+    /// environment and the https MCP servers (mcpSkipTlsVerify) follow at once. The model
+    /// changes only if the settings' model did. The MCP servers started again, by name.
+    pub fn reload_settings(&mut self) -> Result<Vec<String>, String> {
         self.settings.apply_env();
         let config = crate::config::load(&self.settings, &self.overrides)?;
         if config.model != self.config.model || config.provider != self.config.provider {
@@ -241,7 +242,7 @@ impl Session {
         self.agents = crate::extensions::agents(&self.settings.project_root);
         self.skills = crate::extensions::skills(&self.settings.project_root);
         self.reload_rules();
-        Ok(())
+        Ok(self.mcp.borrow_mut().set_skip_tls_verify(self.config.mcp_skip_tls_verify))
     }
 
     pub fn reload_rules(&mut self) {

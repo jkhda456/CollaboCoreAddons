@@ -3,10 +3,11 @@
 //!
 //!   settings   provider ("anthropic" | "openai"), baseUrl, model, apiKey, maxTokens, stream,
 //!              appendSystemPrompt, maxTurns, contextWindow, alwaysThinkingEnabled,
-//!              maxThinkingTokens, outputStyle
+//!              maxThinkingTokens, outputStyle, apiSkipTlsVerify, mcpSkipTlsVerify
 //!   environment CLAUDE_CODE_PROVIDER, then per provider ANTHROPIC_{BASE_URL,MODEL,API_KEY} or
 //!              OPENAI_{BASE_URL,MODEL,API_KEY}; CLAUDE_CODE_MAX_TOKENS, MAX_THINKING_TOKENS
-//!   command line --provider, --base-url, --model, --api-key, …
+//!   command line --provider, --base-url, --model, --api-key, --api-skip-tls-verify,
+//!              --mcp-skip-tls-verify, …
 use crate::settings::Settings;
 
 pub const SETTINGS_FILE: &str = "/etc/collabo/addons/claude-code.json";
@@ -14,6 +15,7 @@ pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_MODEL: &str = "claude-opus-5-5";
 pub const ANTHROPIC_MAX_TOKENS: u32 = 32000;
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const MAX_TURNS: u32 = 300;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Provider {
@@ -78,6 +80,13 @@ pub struct Config {
     pub always_thinking: bool,
     pub thinking_budget: u32,
     pub output_style: Option<String>,
+    /// The model's API over https is reached without checking its certificate (a local
+    /// server's self-signed one), as the host is asked to; apart from MCP's.
+    pub api_skip_tls_verify: bool,
+    /// MCP servers over https are reached without checking their certificate (a local server's
+    /// self-signed one). The host makes the request, so it is the host that skips the check:
+    /// NODE_TLS_REJECT_UNAUTHORIZED has nothing to act on here.
+    pub mcp_skip_tls_verify: bool,
 }
 
 /// What the command line set; None leaves the lower layers' value.
@@ -92,6 +101,8 @@ pub struct Overrides {
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub max_turns: Option<u32>,
+    pub api_skip_tls_verify: Option<bool>,
+    pub mcp_skip_tls_verify: Option<bool>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -150,7 +161,7 @@ pub fn load(settings: &Settings, overrides: &Overrides) -> Result<Config, String
         stream: overrides.stream.or_else(|| settings.bool("/stream")).unwrap_or(true),
         system_prompt: overrides.system_prompt.clone(),
         append_system_prompt: overrides.append_system_prompt.clone().or_else(|| settings.str("/appendSystemPrompt")),
-        max_turns: overrides.max_turns.or_else(|| settings.u64("/maxTurns").map(|n| n as u32)).unwrap_or(200),
+        max_turns: overrides.max_turns.or_else(|| settings.u64("/maxTurns").map(|n| n as u32)).unwrap_or(MAX_TURNS),
         context_window: settings.u64("/contextWindow").unwrap_or(match provider {
             Provider::Anthropic => 200_000,
             Provider::OpenAi => 32_768,
@@ -158,6 +169,8 @@ pub fn load(settings: &Settings, overrides: &Overrides) -> Result<Config, String
         always_thinking: settings.bool("/alwaysThinkingEnabled").unwrap_or(false) || thinking_budget.is_some(),
         thinking_budget: thinking_budget.unwrap_or(10_000),
         output_style: settings.str("/outputStyle"),
+        api_skip_tls_verify: overrides.api_skip_tls_verify.or_else(|| settings.bool("/apiSkipTlsVerify")).unwrap_or(false),
+        mcp_skip_tls_verify: overrides.mcp_skip_tls_verify.or_else(|| settings.bool("/mcpSkipTlsVerify")).unwrap_or(false),
     })
 }
 
@@ -165,7 +178,7 @@ impl Config {
     /// For /config and --show-config: never the key itself.
     pub fn describe(&self) -> String {
         format!(
-            "provider:        {}\nbase URL:        {}\nmodel:           {}\nAPI key:         {}\nmax tokens:      {}\nstreaming:       {}\ncontext window:  {}\nthinking:        {}\nmax turns:       {}",
+            "provider:        {}\nbase URL:        {}\nmodel:           {}\nAPI key:         {}\nmax tokens:      {}\nstreaming:       {}\ncontext window:  {}\nthinking:        {}\nmax turns:       {}\nAPI over https:  {}\nMCP over https:  {}",
             self.provider.name(),
             self.base_url,
             self.model.as_deref().unwrap_or("(the server's first)"),
@@ -181,6 +194,14 @@ impl Config {
                 false => "when asked (think / think hard / ultrathink)".into(),
             },
             self.max_turns,
+            match self.api_skip_tls_verify {
+                true => "certificates not checked (apiSkipTlsVerify)",
+                false => "certificates checked",
+            },
+            match self.mcp_skip_tls_verify {
+                true => "certificates not checked (mcpSkipTlsVerify)",
+                false => "certificates checked",
+            },
         )
     }
 }

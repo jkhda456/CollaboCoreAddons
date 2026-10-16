@@ -6,6 +6,10 @@ POST <scenario> {"turns": [...], "models": [...], "routes": {...}} to /__scenari
 model request takes the next turn: {"text": "...", "thinking": "...", "tools": [{"name", "input"}], "delay": s, "slow": s-per-piece,
 "usage": {"input_tokens": n}}. Both /v1/messages (Anthropic SSE) and /chat/completions (OpenAI SSE)
 are answered. Requests are appended to requests.jsonl; /__requests returns them.
+
+A URL on a host named self-signed.* answers as the host does for a certificate it cannot check,
+unless the request says x-collabo-tls-verify: false. `mock_llm.py PORT https CERT KEY` serves the
+HTTP mode over TLS with that certificate.
 """
 import json, socketserver, sys, os, threading, time
 
@@ -73,6 +77,8 @@ class Handler(socketserver.StreamRequestHandler):
             k, v = h.split(":", 1); headers[k.strip().lower()] = v.strip()
         body = self.rfile.read(int(headers.get("content-length", 0)))
         req = json.loads(body) if body else None
+        if "://self-signed." in url and headers.get("x-collabo-tls-verify") != "false":
+            self.wfile.write(b"ERROR network: io: invalid peer certificate: UnknownIssuer\n"); return
         if url.endswith("/__scenario"):
             with lock:
                 state["turns"] = req["turns"]; state["i"] = 0
@@ -81,6 +87,8 @@ class Handler(socketserver.StreamRequestHandler):
             self.wfile.write(b"200 OK\n\n" + chunk(b"ok") + b"0\nOK\n"); return
         if url.endswith("/mcp"):
             # A streamable-HTTP MCP server: a session id on initialize, SSE for tools/call.
+            if "/auth/" in url and headers.get("x-auth-token") != "t0ken":
+                self.wfile.write(b"401 Unauthorized\n\n" + chunk(b"no x-auth-token") + b"0\nOK\n"); return
             if req.get("id") is None:
                 self.wfile.write(b"202 Accepted\n\n0\nOK\n"); return
             method = req["method"]
@@ -146,6 +154,9 @@ class HttpHandler(socketserver.StreamRequestHandler):
             if not h: break
             k, v = h.split(":", 1); headers[k.strip().lower()] = v.strip()
         body = self.rfile.read(int(headers.get("content-length", 0)))
+        if "x-collabo-tls-verify" in headers:
+            # It is for the engine; reaching a server would be a bug.
+            self.wfile.write(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 25\r\nconnection: close\r\n\r\nx-collabo-tls-verify sent"); return
         # Reuse the bridge handler by speaking its protocol to it in memory.
         import io
         request = f"{method} http://h{path}\n".encode() + b"".join(f"{k}: {v}\n".encode() for k, v in headers.items() if k != "host") + b"\n" + body
@@ -183,8 +194,13 @@ class _Tee:
 if __name__ == "__main__":
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     socketserver.ThreadingTCPServer.daemon_threads = True
-    if len(sys.argv) > 2 and sys.argv[2] == "http":
+    if len(sys.argv) > 2 and sys.argv[2] in ("http", "https"):
         with socketserver.ThreadingTCPServer(("127.0.0.1", int(sys.argv[1])), HttpHandler) as s:
+            if sys.argv[2] == "https":
+                import ssl
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(sys.argv[3], sys.argv[4])
+                s.socket = context.wrap_socket(s.socket, server_side=True)
             s.serve_forever()
     socketserver.ThreadingTCPServer.daemon_threads = True
     with socketserver.ThreadingTCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as s:

@@ -57,6 +57,44 @@ adds the app's API key, and streams the answer back. So:
 The add-on lets the guest set the `anthropic-version`, `anthropic-beta`, `mcp-session-id` and
 `mcp-protocol-version` headers (its `addon.json`), which the request API otherwise refuses.
 
+**Certificates.** The host checks an https server's certificate, so the Node CLI's
+`NODE_TLS_REJECT_UNAUTHORIZED=0` has nothing to act on here. For a server with a self-signed
+certificate (or one of a private CA) `claude` asks the host to skip the check
+(`x-collabo-tls-verify: false` on the request API, engine/src/http.rs), separately for
+
+- **the model's API**: `apiSkipTlsVerify: true` or `claude --api-skip-tls-verify`
+  (`/config` → Model connection → Skip API certificate check), and
+- **MCP servers**: `mcpSkipTlsVerify: true` or `claude --mcp-skip-tls-verify`
+  (`/config` → MCP servers → Skip MCP certificate check).
+
+One leaves the other checked; WebFetch is always checked. Only the native engine can (a browser's
+`fetch()` cannot). A certificate the host cannot check fails at once, with a hint, and is not
+retried. The host then never adds an app secret (`apiKey`, `secrets`) to such a request
+and refuses it instead: for a server that needs one, give the engine the CA with
+`COLLABO_CORE_CA_FILE` (a PEM file that replaces the default roots) rather than skipping the check.
+The engine's `--log-network` marks these requests `(certificate not checked)`; the app's network
+event has `tlsVerified: false`. Changed in `/config` or with `/config set KEY true`, either takes
+effect at once: the next request to the model, and the https MCP servers connect again. Since the
+app's `apiKey` is a host-side secret for `baseUrl`'s host, `apiSkipTlsVerify` with it is refused:
+give the key in the sandbox instead (`/config set apiKey`, `--api-key`), or use the engine's switch
+below.
+
+For development the engine can also stop checking certificates altogether, for everything the host
+fetches for the guest (the model's API, WebFetch, MCP, `hfetch`, and the guest's own TLS to a host
+with a secret): `--skip-tls-verify`, `skip-tls-verify = yes` in launcher.conf, or the app's
+`NetworkPolicy(skipTlsVerify: true)` (`policy.update` changes it while the sandbox runs). That is
+the app's choice, so its secrets still go. claude's option is then not needed. Programs that do
+their own TLS in the guest (curl, git, python) still check with their own trust store.
+
+**Headers of MCP servers.** The request API takes only `accept`, `content-type`, `authorization`
+and `x-api-key` from the guest (and what `addon.json` adds); an MCP server whose key goes in a
+header of its own (`"headers": {"X-Auth-Token": "…"}`) fails with `header-not-allowed`. The host
+decides, not the guest: allow the name with the engine's `--allow-header x-auth-token`
+(`allow-header = x-auth-token` in launcher.conf) or the app's
+`NetworkPolicy(extraAllowedHeaders: ['x-auth-token'])`. `Authorization: Bearer …` needs nothing.
+Or keep the key out of the sandbox altogether: a network `secret` for the server's host (https)
+puts the header on from the host.
+
 ## Settings from the app
 
 The app gives them at start; the engine writes them to `/etc/collabo/addons/claude-code.json`, the
@@ -72,7 +110,10 @@ lowest settings layer:
 | `contextWindow` | the tokens the model takes in: the conversation is compacted before it fills. A local server often gives a model less than its own maximum, so set this to what the server gives it; the welcome box shows the value in effect and where it comes from, and `/model` lists each model with the context its server gives it (when the server says: vLLM, SGLang, llama.cpp, Ollama for a loaded model or a `num_ctx` parameter, LM Studio for a loaded model, OpenRouter, …) | 200000 / 32768 |
 | `stream` | streamed answers | `true` |
 | `permissionMode` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (or `allow` / `ask`) | `default` |
-| `appendSystemPrompt`, `maxTurns`, `webSearch`, `alwaysThinkingEnabled`, `maxThinkingTokens` | | |
+| `maxTurns` | model calls in one prompt before `claude` stops (`--max-turns`) | 300 |
+| `apiSkipTlsVerify` | reach the model's API over https without checking its certificate: a local server's self-signed one, or one of a private CA (`--api-skip-tls-verify`); see above | `false` |
+| `mcpSkipTlsVerify` | the same for MCP servers (`--mcp-skip-tls-verify`) | `false` |
+| `appendSystemPrompt`, `webSearch`, `alwaysThinkingEnabled`, `maxThinkingTokens` | | |
 
 Any other Claude Code setting (`permissions`, `hooks`, `env`, `mcpServers`, …) can be given the
 same way. The environment (`CLAUDE_CODE_PROVIDER`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,
@@ -101,6 +142,7 @@ bin/collabo-core-engine --kernel app/images/vmlinux.wasm \
   --addon-config claude-code:provider=openai \
   --addon-config claude-code:baseUrl=http://localhost:11434/v1 \
   --addon-config claude-code:model=qwen3-coder \
+  --addon-config claude-code:mcpSkipTlsVerify=true \
   --mount "$OLDPWD:/work"
 # in the guest: cd /work && claude          (Ctrl-] then q leaves the engine)
 ```
@@ -115,6 +157,8 @@ claude -p "summarize README.md"         # one answer on stdout
 claude -p --output-format stream-json --verbose "…"
 claude -p --allowedTools "Bash(npm test:*) Edit" "make the tests pass"
 claude mcp add fs -- python3 -m my_mcp_server       claude mcp list
+claude mcp add -t http local https://192.168.0.10:8443/mcp
+claude --mcp-skip-tls-verify                       # that server's certificate is self-signed
 claude config set model sonnet
 ```
 

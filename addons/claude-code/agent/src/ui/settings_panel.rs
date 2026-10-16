@@ -39,6 +39,7 @@ fn fields() -> Vec<Field> {
         Field { section: "Model connection", pointer: "/maxTokens", label: "Max output tokens", help: "The longest answer, in tokens.", kind: Kind::Number },
         Field { section: "Model connection", pointer: "/contextWindow", label: "Context window", help: "Tokens the model takes in; the conversation is compacted before it fills.", kind: Kind::Number },
         Field { section: "Model connection", pointer: "/stream", label: "Streaming", help: "Show answers as they arrive. Turn off for servers that stream tool calls badly.", kind: Kind::Switch },
+        Field { section: "Model connection", pointer: "/apiSkipTlsVerify", label: "Skip API certificate check", help: "Reach the model's API over https without checking its certificate (a local server's self-signed one). The app's key is not sent there: give one here, or turn checks off in the engine. --api-skip-tls-verify does it for one run.", kind: Kind::Switch },
         Field { section: "Behaviour", pointer: "/permissions/defaultMode", label: "Default permission mode", help: "The mode sessions start in (Shift+Tab changes it in a session).", kind: Kind::Choice(vec![("default", "default (ask)"), ("acceptEdits", "accept edits"), ("plan", "plan"), ("bypassPermissions", "bypass permissions")]) },
         Field { section: "Behaviour", pointer: "/autoCompactEnabled", label: "Auto-compact", help: "Summarize the conversation when the context is nearly full.", kind: Kind::Switch },
         Field { section: "Behaviour", pointer: "/alwaysThinkingEnabled", label: "Thinking mode", help: "Extended thinking on every request (Anthropic). Tab in the input box toggles it for the session.", kind: Kind::Switch },
@@ -51,6 +52,7 @@ fn fields() -> Vec<Field> {
         Field { section: "Behaviour", pointer: "/preferredNotifChannel", label: "Notifications", help: "Ring the terminal bell when a long turn finishes.", kind: Kind::Choice(vec![("none", "none"), ("terminal_bell", "terminal bell")]) },
         Field { section: "Behaviour", pointer: "/maxTurns", label: "Max turns", help: "Model calls per prompt before Claude stops.", kind: Kind::Number },
         Field { section: "Behaviour", pointer: "/cleanupPeriodDays", label: "Keep transcripts (days)", help: "Conversations older than this are deleted at start.", kind: Kind::Number },
+        Field { section: "MCP servers", pointer: "/mcpSkipTlsVerify", label: "Skip MCP certificate check", help: "Reach MCP servers over https without checking their certificate (a local server's self-signed one). The https servers connect again at once. --mcp-skip-tls-verify does it for one run.", kind: Kind::Switch },
     ]
 }
 
@@ -77,14 +79,14 @@ fn default_text(field: &Field, session: &Session) -> String {
             Provider::OpenAi => "32768".into(),
         },
         "/stream" | "/autoCompactEnabled" | "/webSearch" => "true".into(),
-        "/alwaysThinkingEnabled" | "/verbose" => "false".into(),
+        "/alwaysThinkingEnabled" | "/verbose" | "/apiSkipTlsVerify" | "/mcpSkipTlsVerify" => "false".into(),
         "/maxThinkingTokens" => "10000".into(),
         "/permissions/defaultMode" => "default".into(),
         "/outputStyle" => "default".into(),
         "/preferredNotifChannel" => "none".into(),
         "/theme" => "dark".into(),
         "/editorMode" => "normal".into(),
-        "/maxTurns" => "200".into(),
+        "/maxTurns" => crate::config::MAX_TURNS.to_string(),
         "/cleanupPeriodDays" => "30".into(),
         _ => String::new(),
     }
@@ -285,9 +287,10 @@ fn save(session: &mut Session, scope: Scope, field: &Field, value: Option<Value>
         Ok(path) => path,
         Err(message) => return term::red(&message),
     };
-    if let Err(message) = session.reload_settings() {
-        return term::red(&format!("Saved, but the settings do not work: {message}"));
-    }
+    let restarted = match session.reload_settings() {
+        Ok(restarted) => restarted,
+        Err(message) => return term::red(&format!("Saved, but the settings do not work: {message}")),
+    };
     match field.pointer {
         "/theme" => term::set_theme(&session.settings.str("/theme").unwrap_or_else(|| "dark".into())),
         "/verbose" => super::terminal::VERBOSE.store(session.settings.bool("/verbose").unwrap_or(false), std::sync::atomic::Ordering::Relaxed),
@@ -307,6 +310,7 @@ fn save(session: &mut Session, scope: Scope, field: &Field, value: Option<Value>
     let effective = session.settings.source_of(field.pointer);
     let note = match effective {
         Some(winner) if winner != scope && !removing => format!(" (but the {} settings set it too, and win)", winner.name()),
+        _ if !restarted.is_empty() => format!(" · MCP: {}", session.mcp.borrow().status_of(&restarted)),
         _ => String::new(),
     };
     term::green(&format!("✓ {} {} {file}{note}", field.label, if removing { "reset in" } else { "saved to" }))

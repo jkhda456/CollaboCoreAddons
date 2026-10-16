@@ -5,7 +5,11 @@
 //!   {"mcpServers": {"name": {"type": "http", "url": "https://…", "headers": {…}}}}   (streamable HTTP)
 //! ${VAR} and ${VAR:-default} in them are taken from the environment. A stdio server is a child
 //! process speaking JSON-RPC on its stdin/stdout; an HTTP one is reached through the host's
-//! request API, under the sandbox's network policy.
+//! request API, under the sandbox's network policy. The host checks an https server's
+//! certificate; with mcpSkipTlsVerify (--mcp-skip-tls-verify) it is asked not to
+//! (`x-collabo-tls-verify: false`), for a local server's self-signed one. A header of the
+//! server's config beyond the request API's few (accept, content-type, authorization, x-api-key)
+//! must be allowed by the host's policy: the guest cannot allow one itself.
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -22,7 +26,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum Transport {
     Stdio { child: Child, stdin: ChildStdin, stdout: BufReader<ChildStdout> },
-    Http { url: String, headers: Vec<(String, String)>, session: Option<String> },
+    Http { url: String, headers: Vec<(String, String)>, session: Option<String>, verify_tls: bool },
 }
 
 pub struct Server {
@@ -32,6 +36,8 @@ pub struct Server {
     pub status: String,
     pub tools: Vec<Value>,
     pub instructions: Option<String>,
+    /// As configured (before ${VAR} expansion), to start it again.
+    config: Value,
     transport: Option<Transport>,
     next_id: u64,
 }
@@ -39,6 +45,7 @@ pub struct Server {
 #[derive(Default)]
 pub struct Mcp {
     pub servers: Vec<Server>,
+    skip_tls_verify: bool,
 }
 
 /// ${VAR} and ${VAR:-default}.
@@ -132,8 +139,8 @@ fn content_to_outcome(result: &Value) -> Outcome {
 }
 
 impl Server {
-    fn start(name: &str, scope: &str, config: &Value) -> Server {
-        let mut server = Server { name: name.to_string(), scope: scope.to_string(), status: "connecting".into(), tools: Vec::new(), instructions: None, transport: None, next_id: 0 };
+    fn start(name: &str, scope: &str, config: &Value, skip_tls_verify: bool) -> Server {
+        let mut server = Server { name: name.to_string(), scope: scope.to_string(), status: "connecting".into(), tools: Vec::new(), instructions: None, config: config.clone(), transport: None, next_id: 0 };
         let config = expand_value(config);
         let kind = config.get("type").and_then(Value::as_str).unwrap_or(if config.get("url").is_some() { "http" } else { "stdio" });
         let transport = match kind {
@@ -169,7 +176,7 @@ impl Server {
                     .and_then(Value::as_object)
                     .map(|map| map.iter().map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_string())).collect())
                     .unwrap_or_default();
-                Transport::Http { url: url.to_string(), headers, session: None }
+                Transport::Http { url: url.to_string(), headers, session: None, verify_tls: !skip_tls_verify }
             }
             other => {
                 server.status = format!("failed: unknown transport {other}");
@@ -231,8 +238,8 @@ impl Server {
                 let _ = writeln!(stdin, "{message}");
                 let _ = stdin.flush();
             }
-            Some(Transport::Http { url, headers, session }) => {
-                let _ = http_post(url, headers, session, &message);
+            Some(Transport::Http { url, headers, session, verify_tls }) => {
+                let _ = http_post(url, headers, session, *verify_tls, &message);
             }
             None => {}
         }
@@ -244,7 +251,7 @@ impl Server {
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let reply = match &mut self.transport {
             None => return Err("not connected".into()),
-            Some(Transport::Http { url, headers, session }) => http_post(url, headers, session, &message)?.ok_or("no answer")?,
+            Some(Transport::Http { url, headers, session, verify_tls }) => http_post(url, headers, session, *verify_tls, &message)?.ok_or("no answer")?,
             Some(Transport::Stdio { child, stdin, stdout }) => {
                 writeln!(stdin, "{message}").and_then(|_| stdin.flush()).map_err(|error| format!("the server's stdin: {error}"))?;
                 let deadline = Instant::now() + timeout;
@@ -309,14 +316,24 @@ fn read_line(reader: &mut BufReader<ChildStdout>, deadline: Instant) -> Result<S
 }
 
 /// One JSON-RPC message to a streamable-HTTP server; its answer (JSON or an SSE stream).
-fn http_post(url: &str, headers: &[(String, String)], session: &mut Option<String>, message: &Value) -> Result<Option<Value>, String> {
+fn http_post(url: &str, headers: &[(String, String)], session: &mut Option<String>, verify_tls: bool, message: &Value) -> Result<Option<Value>, String> {
     let mut all: Vec<(&str, &str)> = vec![("content-type", "application/json"), ("accept", "application/json, text/event-stream"), ("mcp-protocol-version", PROTOCOL_VERSION)];
     if let Some(id) = session.as_deref() {
         all.push(("mcp-session-id", id));
     }
+    all.extend(bridge::skip_tls_header(url, !verify_tls));
     all.extend(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let body = serde_json::to_vec(message).expect("message serializes");
-    let response = bridge::request("POST", url, &all, &body).map_err(|error| error.to_string())?;
+    let response = bridge::request("POST", url, &all, &body).map_err(|error| match error.kind.as_str() {
+        "network" if verify_tls && bridge::is_certificate_error(&error) => {
+            format!("{error} (a self-signed or private certificate: mcpSkipTlsVerify or --mcp-skip-tls-verify skips the check)")
+        }
+        "header-not-allowed" => format!(
+            "{error} (the host must allow it: the engine's --allow-header NAME, allow-header = NAME in launcher.conf, \
+             or the app's NetworkPolicy.extraAllowedHeaders)"
+        ),
+        _ => error.to_string(),
+    })?;
     if let Some(id) = response.header("mcp-session-id") {
         *session = Some(id.to_string());
     }
@@ -345,8 +362,40 @@ fn http_post(url: &str, headers: &[(String, String)], session: &mut Option<Strin
 }
 
 impl Mcp {
-    pub fn connect(servers: &[(String, String, Value)]) -> Mcp {
-        Mcp { servers: servers.iter().map(|(name, scope, config)| Server::start(name, scope, config)).collect() }
+    pub fn connect(servers: &[(String, String, Value)], skip_tls_verify: bool) -> Mcp {
+        Mcp { servers: servers.iter().map(|(name, scope, config)| Server::start(name, scope, config, skip_tls_verify)).collect(), skip_tls_verify }
+    }
+
+    /// mcpSkipTlsVerify changed (/config): the https servers start again with it, so one that
+    /// failed on its certificate connects now. The names of those started again.
+    pub fn set_skip_tls_verify(&mut self, skip: bool) -> Vec<String> {
+        if skip == self.skip_tls_verify {
+            return Vec::new();
+        }
+        self.skip_tls_verify = skip;
+        let mut restarted = Vec::new();
+        for server in self.servers.iter_mut() {
+            let url = expand_value(&server.config).get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            if bridge::is_https(&url) {
+                server.stop();
+                *server = Server::start(&server.name, &server.scope, &server.config, skip);
+                restarted.push(server.name.clone());
+            }
+        }
+        restarted
+    }
+
+    /// "name ✓ connected" / "name ✗ why" for these servers, for a message.
+    pub fn status_of(&self, names: &[String]) -> String {
+        self.servers
+            .iter()
+            .filter(|server| names.contains(&server.name))
+            .map(|server| match server.status.as_str() {
+                "connected" => format!("{} ✓ connected", server.name),
+                other => format!("{} ✗ {other}", server.name),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The servers' tools in the Messages API's shape.
@@ -409,14 +458,14 @@ while IFS= read -r line; do
   esac
 done"#;
         let config = json!({"command": "/bin/sh", "args": ["-c", script]});
-        let mut mcp = Mcp::connect(&[("my srv".into(), "project".into(), config)]);
+        let mut mcp = Mcp::connect(&[("my srv".into(), "project".into(), config)], false);
         assert_eq!(mcp.servers[0].status, "connected");
         assert_eq!(mcp.instructions(), [("my srv".to_string(), "be nice".to_string())]);
         let specs = mcp.specs();
         assert_eq!(specs[0]["name"], "mcp__my_srv__echo_it");
         let outcome = mcp.call("mcp__my_srv__echo_it", &json!({"text": "x"}));
         assert_eq!((outcome.text.as_str(), outcome.is_error), ("echoed", false));
-        let bad = Mcp::connect(&[("gone".into(), "user".into(), json!({"command": "/nonexistent"}))]);
+        let bad = Mcp::connect(&[("gone".into(), "user".into(), json!({"command": "/nonexistent"}))], false);
         assert!(bad.servers[0].status.starts_with("failed"));
     }
 

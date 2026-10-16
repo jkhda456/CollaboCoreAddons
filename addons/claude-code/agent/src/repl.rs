@@ -1192,7 +1192,10 @@ fn config_command(session: &mut Session, args: &str) -> String {
             object.insert(key.clone(), value.clone());
         }) {
             Ok(path) => match session.reload_settings() {
-                Ok(()) => format!("Set {key} in {} (in effect now)", path.display()),
+                Ok(restarted) if !restarted.is_empty() => {
+                    format!("Set {key} in {} (in effect now; MCP: {})", path.display(), session.mcp.borrow().status_of(&restarted))
+                }
+                Ok(_) => format!("Set {key} in {} (in effect now)", path.display()),
                 Err(message) => format!("Set {key} in {}, but the settings do not work: {message}", path.display()),
             },
             Err(message) => message,

@@ -12,6 +12,24 @@ use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 const DEFAULT_PORT: u32 = 1080;
+/// For the host, not the server: `false` skips the certificate check of an https URL
+/// (engine/src/http.rs; the native engine only).
+const TLS_VERIFY_HEADER: &str = "x-collabo-tls-verify";
+
+/// The header that asks the host not to check `url`'s certificate, when `skip` and it is https:
+/// mcpSkipTlsVerify for MCP servers, apiSkipTlsVerify for the model's API.
+pub fn skip_tls_header(url: &str, skip: bool) -> Option<(&'static str, &'static str)> {
+    (skip && is_https(url)).then_some((TLS_VERIFY_HEADER, "false"))
+}
+
+pub fn is_https(url: &str) -> bool {
+    url.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
+/// The host could not check the server's certificate (a self-signed or private one).
+pub fn is_certificate_error(error: &Error) -> bool {
+    error.kind == "network" && error.message.contains("certificate")
+}
 
 #[derive(Debug)]
 pub struct Error {

@@ -22,7 +22,7 @@ t = ptydrive.Session([f"{RT}/bin/collabo-core-engine", "--kernel", f"{RT}/app/im
                       "--addon-config", "claude-code:contextWindow=50000"],
                      cols=110, rows=40, env={"TERM": "xterm-256color"})
 try:
-    t.expect(r"# ", 90)
+    t.expect(r"@collabo:\S*# ", 90)   # the shell's prompt, not the "# " of the kernel's banner
     t.send("cd /work && TERM=xterm-256color claude\r")
     t.expect("Welcome to Claude Code", 60)
     t.expect("for shortcuts", 20)

@@ -6,7 +6,8 @@
 #   tests/run.sh native   the native half only (no runtime needed)
 #
 # The model answers from a script each test loads; it listens on 127.0.0.1:18090 (the host
-# request API's protocol, for a native claude: COLLABO_BRIDGE) and 18091 (HTTP, for the guest).
+# request API's protocol, for a native claude: COLLABO_BRIDGE) and 18091 (HTTP, for the guest),
+# and 18092 over https with a certificate of a private CA (tests/fixtures), for the guest's MCP.
 set -euo pipefail
 T="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 A="$(dirname "$T")"
@@ -22,7 +23,9 @@ python3 "$T/mock_llm.py" 18090 >"$work/bridge.log" 2>&1 &
 bridge=$!
 python3 "$T/mock_llm.py" 18091 http >"$work/http.log" 2>&1 &
 http=$!
-trap 'kill $bridge $http 2>/dev/null; rm -rf "$work"' EXIT
+python3 "$T/mock_llm.py" 18092 https "$ROOT/tests/fixtures/localhost-cert.pem" "$ROOT/tests/fixtures/localhost-key.pem" >"$work/https.log" 2>&1 &
+https=$!
+trap 'kill $bridge $http $https 2>/dev/null; rm -rf "$work"' EXIT
 sleep 0.5
 
 echo "== unit tests"

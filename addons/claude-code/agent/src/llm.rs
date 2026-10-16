@@ -30,9 +30,17 @@ impl From<bridge::Error> for Error {
         if crate::interrupt::is_set() {
             return Error { message: "interrupted by the user".into(), interrupted: true, retry: false, retry_after: None };
         }
-        let retry = matches!(error.kind.as_str(), "network" | "timeout" | "io");
+        // A certificate the host cannot check stays so: no use trying again.
+        let retry = matches!(error.kind.as_str(), "network" | "timeout" | "io") && !bridge::is_certificate_error(&error);
         let mut message = error.to_string();
-        if message.contains("allowHostLoopback") {
+        if bridge::is_certificate_error(&error) {
+            message.push_str("\n  (a self-signed or private certificate: apiSkipTlsVerify or --api-skip-tls-verify skips the check)");
+        } else if error.kind == "denied" && message.contains("certificate is checked") {
+            message.push_str(
+                "\n  (with apiSkipTlsVerify the host keeps the app's key for an unchecked server: give the key here \
+                 (/config set apiKey KEY, --api-key), or have the engine check no certificate (--skip-tls-verify))",
+            );
+        } else if message.contains("allowHostLoopback") {
             message.push_str(
                 "\n  (the host makes this request, so localhost is the host computer: start the sandbox with \
                  network.allowHostLoopback: true, or --allow-loopback on the command line)",
@@ -139,9 +147,11 @@ impl Sink for Guard<'_> {
     }
 }
 
-fn post(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<bridge::Response, Error> {
+fn post(config: &Config, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<bridge::Response, Error> {
     let bytes = serde_json::to_vec(body).expect("request serializes");
-    let response = bridge::request("POST", url, headers, &bytes)?;
+    let mut headers = headers.to_vec();
+    headers.extend(bridge::skip_tls_header(url, config.api_skip_tls_verify));
+    let response = bridge::request("POST", url, &headers, &bytes)?;
     if response.status < 400 {
         return Ok(response);
     }
@@ -225,7 +235,7 @@ fn anthropic(config: &Config, request: &Request, sink: &mut dyn Sink) -> Result<
     if let Some(key) = &config.api_key {
         headers.push(("x-api-key", key));
     }
-    let response = post(&anthropic_url(&config.base_url, "/messages"), &headers, &body)?;
+    let response = post(config, &anthropic_url(&config.base_url, "/messages"), &headers, &body)?;
 
     if !config.stream {
         let message: Value = serde_json::from_str(&response.text().map_err(Error::from)?)
@@ -478,7 +488,7 @@ fn openai(config: &Config, request: &Request, sink: &mut dyn Sink) -> Result<Tur
     if let Some(bearer) = &bearer {
         headers.push(("authorization", bearer));
     }
-    let response = post(&format!("{}/chat/completions", config.base_url), &headers, &body)?;
+    let response = post(config, &format!("{}/chat/completions", config.base_url), &headers, &body)?;
 
     if !config.stream {
         let answer: Value = serde_json::from_str(&response.text().map_err(Error::from)?)
@@ -641,6 +651,7 @@ fn ask_json(config: &Config, method: &str, url: &str, body: Option<&Value>) -> O
     if body.is_some() {
         headers.push(("content-type", "application/json"));
     }
+    headers.extend(bridge::skip_tls_header(url, config.api_skip_tls_verify));
     let body = body.map(Value::to_string).unwrap_or_default();
     let response = bridge::request(method, url, &headers, body.as_bytes()).ok()?;
     if response.status >= 400 {
@@ -724,6 +735,7 @@ fn model_entries(config: &Config) -> Result<Vec<Value>, Error> {
             headers.push(("x-api-key", key));
         }
     }
+    headers.extend(bridge::skip_tls_header(&url, config.api_skip_tls_verify));
     let response = bridge::request("GET", &url, &headers, &[])?;
     let status = response.status;
     let mut body = String::new();

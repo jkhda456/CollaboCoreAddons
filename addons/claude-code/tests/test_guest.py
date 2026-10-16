@@ -80,6 +80,53 @@ code, out, err = guest("claude -p --allowedTools mcp__sys 'which machine?'")
 r = requests()
 check("guest: MCP stdio server in the guest", results(r[1])[0]["content"] == "wasm", results(r[1]) if len(r) > 1 else (out, err[-800:]))
 
+# 4b. An MCP server over https whose certificate is of a private CA (tests/fixtures), as a local
+# server's self-signed one: the engine refuses it, unless claude asks it not to check.
+json.dump({"mcpServers": {"tls": {"type": "http", "url": "https://localhost:18092/mcp"}}}, open(os.path.join(work, ".mcp.json"), "w"))
+code, out, err = guest("claude mcp list")
+check("guest: https MCP, private CA: the engine refuses it", "tls: project - ✗ failed: network:" in out and "certificate" in out and "mcpSkipTlsVerify" in out, (out, err[-800:]))
+code, out, err = guest("claude mcp list --mcp-skip-tls-verify")
+check("guest: claude mcp list --mcp-skip-tls-verify", "tls: project - ✓ Connected (1 tools)" in out, (out, err[-800:]))
+scenario([{"tools": [{"name": "mcp__tls__lookup", "input": {"q": "guest"}}]}, {"text": "done"}])
+code, out, err = guest("claude -p --allowedTools mcp__tls 'look it up'", ["--addon-config", "claude-code:mcpSkipTlsVerify=true"])
+r = requests()
+check("guest: mcpSkipTlsVerify from the app: the tool works", len(r) > 1 and results(r[1])[0]["content"] == "looked up guest", results(r[1]) if len(r) > 1 else (out, err[-800:]))
+os.remove(os.path.join(work, ".mcp.json"))
+
+# 4b'. The engine's --skip-tls-verify: no certificate is checked for anything the host fetches,
+# without claude's option; the app's secrets still go (the app chose it).
+json.dump({"mcpServers": {"tls": {"type": "http", "url": "https://localhost:18092/mcp"}, "keyed": {"type": "http", "url": "https://localhost:18092/auth/mcp"}}}, open(os.path.join(work, ".mcp.json"), "w"))
+code, out, err = guest("claude mcp list; hfetch https://localhost:18092/page", ["--skip-tls-verify", "--secret", "localhost:x-auth-token=t0ken"])
+check("guest: engine --skip-tls-verify: https MCP connects without claude's option", "tls: project - ✓ Connected (1 tools)" in out, (out, err[-800:]))
+check("guest: engine --skip-tls-verify: the app's secret still goes", "keyed: project - ✓ Connected (1 tools)" in out, (out, err[-800:]))
+check("guest: engine --skip-tls-verify: hfetch too, and a warning at start", "fetched text" in out and "--skip-tls-verify: https certificates are not checked" in err, (out, err[-800:]))
+os.remove(os.path.join(work, ".mcp.json"))
+
+# 4b''. The model's API over https with a certificate of a private CA (the mock on 18092, which
+# has no script: it answers "(no more scripted turns)"): apiSkipTlsVerify, apart from MCP's.
+API = ["--addon-config", "claude-code:baseUrl=https://localhost:18092"]
+code, out, err = guest("claude -p hi", API)
+check("guest: model API, private CA: refused at once, with a hint", code != 0 and "certificate" in err and "apiSkipTlsVerify" in err and "retrying" not in err, (code, out, err[-800:]))
+code, out, err = guest("claude -p hi", API + ["--addon-config", "claude-code:apiSkipTlsVerify=true"])
+check("guest: apiSkipTlsVerify from the app: the model answers", out.strip() == "(no more scripted turns)", (code, out, err[-800:]))
+code, out, err = guest("claude -p --api-skip-tls-verify hi", API + ["--addon-config", "claude-code:apiKey=k-123"])
+check("guest: the app's key is not sent unchecked: refused, with a hint", code != 0 and "only sent to a server whose certificate is checked" in err and "--skip-tls-verify" in err, (code, out, err[-800:]))
+scenario([])
+code, out, err = guest("claude -p hi", API + ["--addon-config", "claude-code:apiKey=k-123", "--skip-tls-verify"])
+r = requests()
+check("guest: the engine's --skip-tls-verify: the model answers, with the app's key", out.strip() == "(no more scripted turns)" and r and r[-1]["headers"].get("x-api-key") == "k-123", (out, err[-800:], r[-1]["headers"] if r else None))
+
+# 4c. An MCP server that takes its key in a header of its own: the engine refuses the header
+# unless its policy allows it (--allow-header).
+json.dump({"mcpServers": {"auth": {"type": "http", "url": "http://localhost:18091/auth/mcp", "headers": {"X-Auth-Token": "t0ken"}}}}, open(os.path.join(work, ".mcp.json"), "w"))
+code, out, err = guest("claude mcp list")
+check("guest: an MCP header the policy does not allow: refused, with a hint", 'auth: project - ✗ failed: header-not-allowed: request header "x-auth-token" is not allowed' in out and "--allow-header" in out, (out, err[-800:]))
+scenario([{"tools": [{"name": "mcp__auth__lookup", "input": {"q": "key"}}]}, {"text": "done"}])
+code, out, err = guest("claude -p --allowedTools mcp__auth 'look it up'", ["--allow-header", "x-auth-token"])
+r = requests()
+check("guest: --allow-header x-auth-token: the server gets its key", len(r) > 1 and results(r[1])[0]["content"] == "looked up key", results(r[1]) if len(r) > 1 else (out, err[-800:]))
+os.remove(os.path.join(work, ".mcp.json"))
+
 # 5. Sessions persist in the guest's ~/.claude: --continue within one boot.
 scenario([{"text": "first"}, {"text": "second"}])
 code, out, err = guest("claude -p 'remember 7' && claude -p -c 'what?'")
